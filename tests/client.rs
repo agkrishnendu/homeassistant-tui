@@ -5,9 +5,9 @@ mod support;
 use std::time::Duration;
 
 use chrono::Utc;
-use ha_tui::config::ws_url;
-use ha_tui::ha::client::{self, ConnStatus, HaCommand, HaEvent};
-use ha_tui::ha::types::ServiceCall;
+use homeassistant_tui::config::ws_url;
+use homeassistant_tui::ha::client::{self, ConnStatus, HaCommand, HaEvent};
+use homeassistant_tui::ha::types::ServiceCall;
 use support::mock::MockHa;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 

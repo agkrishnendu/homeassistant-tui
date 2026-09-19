@@ -7,15 +7,15 @@ use crossterm::event::EventStream;
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
-use ha_tui::app::App;
-use ha_tui::config::Config;
-use ha_tui::ha::client::{self, ConnStatus, HaEvent};
+use homeassistant_tui::app::App;
+use homeassistant_tui::config::Config;
+use homeassistant_tui::ha::client::{self, ConnStatus, HaEvent};
 
 /// A terminal UI for Home Assistant.
 #[derive(Parser, Debug)]
 #[command(version, about)]
 struct Cli {
-    /// Config file (default: ~/.config/ha-tui/config.toml)
+    /// Config file (default: ~/.config/homeassistant-tui/config.toml)
     #[arg(long, short)]
     config: Option<PathBuf>,
     /// Home Assistant URL, e.g. http://homeassistant.local:8123
@@ -58,7 +58,7 @@ async fn run(
     let mut input = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(500));
     loop {
-        terminal.draw(|f| ha_tui::ui::render(f, &mut app))?;
+        terminal.draw(|f| homeassistant_tui::ui::render(f, &mut app))?;
         tokio::select! {
             ev = input.next() => match ev {
                 Some(Ok(ev)) => app.on_terminal_event(ev),

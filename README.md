@@ -1,4 +1,4 @@
-# ha-tui
+# homeassistant-tui
 
 A fast, keyboard-driven terminal UI for [Home Assistant](https://www.home-assistant.io/), written in Rust with [Ratatui](https://ratatui.rs).
 
@@ -14,17 +14,31 @@ It talks to Home Assistant over its WebSocket API, so states update live, and it
 - **Fuzzy filter** (`/`) and **command palette** (`:` / `Ctrl-p`): jump to, toggle, or run anything by name.
 - Confirmation before unlocking locks or moving garage doors and gates.
 
-## Setup
+## Install
+
+Prebuilt binaries for Linux, macOS and Windows are on the [releases page](https://github.com/agkrishnendu/ha-tui/releases/latest), or:
 
 ```sh
-cargo install --path .            # or: cargo build --release
-mkdir -p ~/.config/ha-tui
-cp config.example.toml ~/.config/ha-tui/config.toml   # then edit url + token
-ha-tui --dump                     # connectivity check: prints entity counts and exits
-ha-tui
+# Linux / macOS
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/agkrishnendu/ha-tui/releases/latest/download/homeassistant-tui-installer.sh | sh
+
+# Windows (PowerShell)
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/agkrishnendu/ha-tui/releases/latest/download/homeassistant-tui-installer.ps1 | iex"
+
+# With a Rust toolchain (1.88+)
+cargo install homeassistant-tui     # or: cargo binstall homeassistant-tui
 ```
 
-Instead of a config file you can use environment variables: `HA_URL=http://homeassistant.local:8123 HA_TOKEN=... ha-tui`.
+## Setup
+
+Create a long-lived access token in Home Assistant (your profile → Security → Long-lived access tokens), save [`config.example.toml`](config.example.toml) as your config file and fill in the URL and token, then:
+
+```sh
+homeassistant-tui --dump     # connectivity check: prints entity counts and exits
+homeassistant-tui
+```
+
+The config file lives at `~/.config/homeassistant-tui/config.toml` on Linux, `~/Library/Application Support/homeassistant-tui/config.toml` on macOS and `%APPDATA%\homeassistant-tui\config\config.toml` on Windows (or pass `--config <path>`). Instead of a config file you can use environment variables: `HA_URL=http://homeassistant.local:8123 HA_TOKEN=... homeassistant-tui`.
 
 ## Keys
 
@@ -76,3 +90,7 @@ Layout:
 - `src/app.rs`: app state and key handling
 - `src/ui/`: rendering
 - `tests/support/mock.rs`: fake Home Assistant
+
+## License
+
+[0BSD](LICENSE): do whatever you like with it, no attribution required.

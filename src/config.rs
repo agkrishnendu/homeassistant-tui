@@ -20,7 +20,8 @@ pub struct Config {
 
 impl Config {
     pub fn default_path() -> Option<PathBuf> {
-        directories::ProjectDirs::from("", "", "ha-tui").map(|d| d.config_dir().join("config.toml"))
+        directories::ProjectDirs::from("", "", "homeassistant-tui")
+            .map(|d| d.config_dir().join("config.toml"))
     }
 
     /// Resolve config from (highest precedence first): CLI/env overrides, then the config file.
@@ -108,7 +109,7 @@ fn run_token_command(cmd: &str) -> Result<String> {
         let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
         bail!(
             "token_command `{cmd}` returned no token ({}{}).\n\
-             Is the token stored? e.g. secret-tool store --label=\"ha-tui Home Assistant token\" service ha-tui",
+             Is the token stored? e.g. secret-tool store --label=\"homeassistant-tui Home Assistant token\" service homeassistant-tui",
             out.status,
             if stderr.is_empty() {
                 String::new()

@@ -1,4 +1,4 @@
-//! A fake Home Assistant for trying ha-tui without a real instance.
+//! A fake Home Assistant for trying homeassistant-tui without a real instance.
 //!
 //!   cargo run --example mock_ha            # listens on 127.0.0.1:8124, token "demo"
 //!   HA_URL=http://127.0.0.1:8124 HA_TOKEN=demo cargo run

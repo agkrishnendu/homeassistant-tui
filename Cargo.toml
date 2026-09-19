@@ -1,7 +1,15 @@
 [package]
-name = "ha-tui"
+name = "homeassistant-tui"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
+description = "A fast, keyboard-driven terminal UI for Home Assistant"
+license = "0BSD"
+repository = "https://github.com/agkrishnendu/ha-tui"
+readme = "README.md"
+keywords = ["home-assistant", "tui", "ratatui", "smart-home", "terminal"]
+categories = ["command-line-utilities"]
+exclude = ["/.github"]
 
 [dependencies]
 chrono = { version = "0.4.45", features = ["serde"] }
@@ -21,3 +29,8 @@ toml = "1.1.6"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

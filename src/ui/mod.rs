@@ -64,7 +64,7 @@ fn render_tabs(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(tabs, left_area);
     let brand = Line::from(vec![
         Span::styled(right, theme::dim()),
-        Span::styled("ha-tui ", theme::title()),
+        Span::styled("homeassistant-tui ", theme::title()),
     ])
     .right_aligned();
     f.render_widget(brand, right_area);
