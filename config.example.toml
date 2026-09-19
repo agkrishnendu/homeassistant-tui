@@ -1,0 +1,13 @@
+# Copy to ~/.config/ha-tui/config.toml and `chmod 600` it if you put the token inline.
+
+# Base URL of your Home Assistant instance (http(s)://, the /api/websocket path is added for you).
+url = "http://homeassistant.local:8123"
+
+# A long-lived access token: Home Assistant → your profile → Security → Long-lived access tokens.
+# Either inline:
+# token = "eyJhbGciOi..."
+# ...or, preferably, fetched from a secret store at startup:
+token_command = "secret-tool lookup service ha-tui"
+# token_command = "pass show home/ha-token"
+
+# HA_URL / HA_TOKEN environment variables (or --url / --token) override this file.
