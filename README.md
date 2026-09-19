@@ -16,14 +16,14 @@ It talks to Home Assistant over its WebSocket API, so states update live, and it
 
 ## Install
 
-Prebuilt binaries for Linux, macOS and Windows are on the [releases page](https://github.com/agkrishnendu/ha-tui/releases/latest), or:
+Prebuilt binaries for Linux, macOS and Windows are on the [releases page](https://github.com/agkrishnendu/homeassistant-tui/releases/latest), or:
 
 ```sh
 # Linux / macOS
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/agkrishnendu/ha-tui/releases/latest/download/homeassistant-tui-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/agkrishnendu/homeassistant-tui/releases/latest/download/homeassistant-tui-installer.sh | sh
 
 # Windows (PowerShell)
-powershell -ExecutionPolicy Bypass -c "irm https://github.com/agkrishnendu/ha-tui/releases/latest/download/homeassistant-tui-installer.ps1 | iex"
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/agkrishnendu/homeassistant-tui/releases/latest/download/homeassistant-tui-installer.ps1 | iex"
 
 # With a Rust toolchain (1.88+)
 cargo install homeassistant-tui     # or: cargo binstall homeassistant-tui
