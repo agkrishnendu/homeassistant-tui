@@ -90,7 +90,7 @@ async fn dump(mut events: mpsc::UnboundedReceiver<HaEvent>) -> Result<()> {
             ev = events.recv() => match ev {
                 None => bail!("client stopped"),
                 Some(HaEvent::Status(ConnStatus::Connected { version })) => {
-                    println!("connected: Home Assistant {version}");
+                    out(format_args!("connected: Home Assistant {version}"))?;
                 }
                 Some(HaEvent::Status(ConnStatus::AuthFailed(m))) => bail!("authentication failed: {m}"),
                 Some(HaEvent::Status(ConnStatus::Disconnected { error, .. })) => bail!("connection failed: {error}"),
@@ -99,20 +99,29 @@ async fn dump(mut events: mpsc::UnboundedReceiver<HaEvent>) -> Result<()> {
                     for st in &s.states {
                         *by_domain.entry(st.domain()).or_default() += 1;
                     }
-                    println!(
+                    out(format_args!(
                         "{} entities, {} areas, {} devices, {} registry entries",
                         s.states.len(),
                         s.areas.len(),
                         s.devices.len(),
                         s.entities.len()
-                    );
+                    ))?;
                     for (d, n) in by_domain {
-                        println!("  {d:<24} {n}");
+                        out(format_args!("  {d:<24} {n}"))?;
                     }
                     return Ok(());
                 }
                 Some(_) => {}
             },
         }
+    }
+}
+
+/// Print a line to stdout. A closed pipe (e.g. `--dump | head -1`) exits quietly, like other CLI tools.
+fn out(line: std::fmt::Arguments) -> Result<()> {
+    use std::io::Write;
+    match writeln!(std::io::stdout(), "{line}") {
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => std::process::exit(0),
+        r => Ok(r?),
     }
 }
