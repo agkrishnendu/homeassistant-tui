@@ -6,7 +6,7 @@ url = "http://homeassistant.local:8123"
 # A long-lived access token: Home Assistant → your profile → Security → Long-lived access tokens.
 # Either inline:
 # token = "eyJhbGciOi..."
-# ...or, preferably, fetched from a secret store at startup:
+# ...or, preferably, fetched from a secret store at startup (run with `sh -c`, or `cmd /C` on Windows):
 token_command = "secret-tool lookup service homeassistant-tui"
 # token_command = "pass show home/ha-token"
 

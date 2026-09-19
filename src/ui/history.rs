@@ -57,57 +57,97 @@ pub fn render(f: &mut Frame, app: &App) {
 
     let end = Utc::now();
     let start = end - Duration::hours(24);
-    if let Some(values) = numeric(points) {
-        render_chart(f, inner, h, &values, start, end);
+    // The popup can stay open past its initial 24h: drop what has scrolled out of view.
+    let points = in_window(points, start);
+    if let Some(series) = numeric(points, end) {
+        render_chart(f, inner, h, &series, start, end);
     } else {
         render_timeline(f, inner, points, start, end);
     }
 }
 
-/// Numeric (seconds since `start`, value) pairs, or `None` if the entity isn't numeric.
-fn numeric(points: &[HistoryPoint]) -> Option<Vec<(DateTime<Utc>, f64)>> {
-    let mut out = Vec::new();
+/// The points from the one in effect at `start` onwards.
+fn in_window(points: &[HistoryPoint], start: DateTime<Utc>) -> &[HistoryPoint] {
+    let first = points
+        .partition_point(|p| p.when <= start)
+        .saturating_sub(1);
+    &points[first..]
+}
+
+/// A numeric history, split into runs of readings wherever the sensor had no value.
+#[derive(Debug, PartialEq)]
+struct Series {
+    /// Each run holds (time, value) steps and ends where the value stopped being current.
+    runs: Vec<Vec<(DateTime<Utc>, f64)>>,
+    /// The current reading, or `None` if the sensor is unavailable now.
+    now: Option<f64>,
+}
+
+/// The history as numbers, or `None` if the entity isn't numeric.
+fn numeric(points: &[HistoryPoint], end: DateTime<Utc>) -> Option<Series> {
+    let mut runs = Vec::new();
+    let mut run: Vec<(DateTime<Utc>, f64)> = Vec::new();
     let mut any_numeric = false;
     for p in points {
         match p.state.parse::<f64>() {
-            Ok(v) => {
+            Ok(v) if v.is_finite() => {
                 any_numeric = true;
-                out.push((p.when, v));
+                run.push((p.when, v));
             }
-            // Gaps (unavailable/unknown) are skipped, but any other text means it's categorical.
-            Err(_) if matches!(p.state.as_str(), "unavailable" | "unknown" | "") => {}
+            // Unavailable/unknown (or nan/inf) is a gap: the previous reading stops here.
+            Ok(_) => close_run(&mut runs, &mut run, p.when),
+            Err(_) if matches!(p.state.as_str(), "unavailable" | "unknown" | "") => {
+                close_run(&mut runs, &mut run, p.when)
+            }
+            // Any other text means it's categorical.
             Err(_) => return None,
         }
     }
-    any_numeric.then_some(out)
+    let now = run.last().map(|&(_, v)| v);
+    close_run(&mut runs, &mut run, end);
+    any_numeric.then_some(Series { runs, now })
+}
+
+/// End the current run at `at`, holding its last value until then.
+fn close_run(
+    runs: &mut Vec<Vec<(DateTime<Utc>, f64)>>,
+    run: &mut Vec<(DateTime<Utc>, f64)>,
+    at: DateTime<Utc>,
+) {
+    if let Some(&(_, v)) = run.last() {
+        run.push((at, v));
+        runs.push(std::mem::take(run));
+    }
 }
 
 fn render_chart(
     f: &mut Frame,
     area: Rect,
     h: &HistoryView,
-    values: &[(DateTime<Utc>, f64)],
+    series: &Series,
     start: DateTime<Utc>,
     end: DateTime<Utc>,
 ) {
     let secs = |t: DateTime<Utc>| (t.max(start) - start).num_seconds() as f64;
-    let mut data: Vec<(f64, f64)> = values.iter().map(|(t, v)| (secs(*t), *v)).collect();
-    // Extend the last known value to "now" so the line reaches the right edge.
-    if let Some(&(_, v)) = data.last() {
-        data.push((secs(end), v));
-    }
-    let (mut lo, mut hi) = data.iter().fold((f64::MAX, f64::MIN), |(lo, hi), (_, v)| {
-        (lo.min(*v), hi.max(*v))
-    });
-    let pad = ((hi - lo) * 0.1).max(0.5);
-    lo -= pad;
-    hi += pad;
+    let data: Vec<Vec<(f64, f64)>> = series
+        .runs
+        .iter()
+        .map(|run| run.iter().map(|(t, v)| (secs(*t), *v)).collect())
+        .collect();
+    let (min_v, max_v) = data
+        .iter()
+        .flatten()
+        .fold((f64::MAX, f64::MIN), |(lo, hi), (_, v)| {
+            (lo.min(*v), hi.max(*v))
+        });
+    let pad = ((max_v - min_v) * 0.1).max(0.5);
+    let (lo, hi) = (min_v - pad, max_v + pad);
 
     let unit = h.unit.clone().unwrap_or_default();
-    let last = values.last().map(|(_, v)| *v).unwrap_or_default();
-    let (min_v, max_v) = values.iter().fold((f64::MAX, f64::MIN), |(a, b), (_, v)| {
-        (a.min(*v), b.max(*v))
-    });
+    let now = match series.now {
+        Some(v) => format!("{}{unit}", theme::trim_num(v)),
+        None => "unavailable".into(),
+    };
 
     let [summary, chart_area] =
         Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(area);
@@ -115,8 +155,14 @@ fn render_chart(
         Line::from(vec![
             Span::styled(" now ", theme::dim()),
             Span::styled(
-                format!("{}{unit}", theme::trim_num(last)),
-                Style::new().fg(theme::ACCENT).bold(),
+                now,
+                Style::new()
+                    .fg(if series.now.is_some() {
+                        theme::ACCENT
+                    } else {
+                        theme::ERROR
+                    })
+                    .bold(),
             ),
             Span::styled("   min ", theme::dim()),
             Span::raw(format!("{}{unit}", theme::trim_num(min_v))),
@@ -126,11 +172,17 @@ fn render_chart(
         summary,
     );
 
-    let dataset = Dataset::default()
-        .marker(Marker::Braille)
-        .graph_type(GraphType::Line)
-        .style(Style::new().fg(theme::ACCENT))
-        .data(&data);
+    // One dataset per run, so the line breaks where the sensor had no value.
+    let datasets: Vec<Dataset> = data
+        .iter()
+        .map(|run| {
+            Dataset::default()
+                .marker(Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(Style::new().fg(theme::ACCENT))
+                .data(run)
+        })
+        .collect();
     let x_labels: Vec<Line> = [start, start + Duration::hours(12), end]
         .into_iter()
         .map(|t| {
@@ -144,7 +196,7 @@ fn render_chart(
         .into_iter()
         .map(|v| Line::styled(format!("{}{unit}", theme::trim_num(v)), theme::dim()))
         .collect();
-    let chart = Chart::new(vec![dataset])
+    let chart = Chart::new(datasets)
         .x_axis(
             Axis::default()
                 .bounds([0.0, secs(end)])
@@ -238,22 +290,53 @@ fn duration(d: Duration) -> String {
 mod tests {
     use super::*;
 
-    fn p(state: &str) -> HistoryPoint {
+    fn t(h: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(h * 3600, 0).unwrap()
+    }
+
+    fn p(h: i64, state: &str) -> HistoryPoint {
         HistoryPoint {
-            when: Utc::now(),
+            when: t(h),
             state: state.into(),
         }
     }
 
     #[test]
     fn numeric_detection() {
+        assert!(numeric(&[p(0, "on"), p(1, "off")], t(2)).is_none());
+        assert!(numeric(&[p(0, "unavailable")], t(2)).is_none());
+        assert!(numeric(&[p(0, "1.5"), p(1, "unknown")], t(2)).is_some());
+    }
+
+    #[test]
+    fn gaps_split_runs_and_unavailable_is_not_current() {
+        let s = numeric(&[p(0, "21"), p(1, "unavailable")], t(3)).unwrap();
+        assert_eq!(s.runs, vec![vec![(t(0), 21.0), (t(1), 21.0)]]);
+        assert_eq!(s.now, None);
+
+        let s = numeric(&[p(0, "1"), p(1, "2"), p(2, "unknown"), p(4, "3")], t(5)).unwrap();
         assert_eq!(
-            numeric(&[p("1.5"), p("unavailable"), p("2")])
-                .unwrap()
-                .len(),
-            2
+            s.runs,
+            vec![
+                vec![(t(0), 1.0), (t(1), 2.0), (t(2), 2.0)],
+                vec![(t(4), 3.0), (t(5), 3.0)],
+            ]
         );
-        assert!(numeric(&[p("on"), p("off")]).is_none());
-        assert!(numeric(&[p("unavailable")]).is_none());
+        assert_eq!(s.now, Some(3.0));
+    }
+
+    #[test]
+    fn non_finite_values_are_gaps() {
+        let s = numeric(&[p(0, "5"), p(1, "NaN"), p(2, "inf")], t(3)).unwrap();
+        assert_eq!(s.runs, vec![vec![(t(0), 5.0), (t(1), 5.0)]]);
+        assert_eq!(s.now, None);
+    }
+
+    #[test]
+    fn window_keeps_the_point_in_effect_at_start() {
+        let points = [p(0, "1"), p(1, "2"), p(3, "3")];
+        assert_eq!(in_window(&points, t(2)), &points[1..]);
+        assert_eq!(in_window(&points, t(0)), &points[..]);
+        assert!(in_window(&[], t(0)).is_empty());
     }
 }
