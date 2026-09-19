@@ -98,12 +98,20 @@ fn display_path(p: &Option<PathBuf>) -> String {
         .unwrap_or_else(|| "the config file".into())
 }
 
+/// Run `cmd` through the platform shell: `sh -c` on Unix, `cmd /C` on Windows.
+fn shell(cmd: &str) -> Command {
+    let (sh, flag) = if cfg!(windows) {
+        ("cmd", "/C")
+    } else {
+        ("sh", "-c")
+    };
+    let mut c = Command::new(sh);
+    c.arg(flag).arg(cmd);
+    c
+}
+
 fn run_token_command(cmd: &str) -> Result<String> {
-    let out = Command::new("sh")
-        .arg("-c")
-        .arg(cmd)
-        .output()
-        .wrap_err("running token_command")?;
+    let out = shell(cmd).output().wrap_err("running token_command")?;
     let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if !out.status.success() || token.is_empty() {
         let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();

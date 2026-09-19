@@ -57,6 +57,9 @@ pub fn service_for(e: &EntityState, action: Action) -> Option<ServiceCall> {
             } else {
                 -COLOR_TEMP_STEP_K
             };
+            if min > max {
+                return None;
+            }
             let k = (cur + delta).clamp(min, max).round() as i64;
             Some(call("turn_on").with("color_temp_kelvin", k))
         }
@@ -66,7 +69,7 @@ pub fn service_for(e: &EntityState, action: Action) -> Option<ServiceCall> {
             let cur = e.attr_f64("humidity")?;
             let min = e.attr_f64("min_humidity").unwrap_or(0.0);
             let max = e.attr_f64("max_humidity").unwrap_or(100.0);
-            let v = step(cur, action == Increase, 5.0, min, max);
+            let v = step(cur, action == Increase, 5.0, min, max)?;
             Some(call("set_humidity").with("humidity", v as i64))
         }
 
@@ -80,7 +83,7 @@ pub fn service_for(e: &EntityState, action: Action) -> Option<ServiceCall> {
             let step_by = e.attr_f64("target_temp_step").unwrap_or(0.5);
             let min = e.attr_f64("min_temp").unwrap_or(f64::MIN);
             let max = e.attr_f64("max_temp").unwrap_or(f64::MAX);
-            let t = step(cur, action == Increase, step_by, min, max);
+            let t = step(cur, action == Increase, step_by, min, max)?;
             Some(call("set_temperature").with("temperature", t))
         }
         ("climate", CycleMode) => {
@@ -94,7 +97,7 @@ pub fn service_for(e: &EntityState, action: Action) -> Option<ServiceCall> {
         ("cover", Stop) => Some(call("stop_cover")),
         ("cover", Increase | Decrease) => {
             let cur = e.attr_f64("current_position")?;
-            let p = step(cur, action == Increase, POSITION_STEP, 0.0, 100.0);
+            let p = step(cur, action == Increase, POSITION_STEP, 0.0, 100.0)?;
             Some(call("set_cover_position").with("position", p as i64))
         }
 
@@ -146,7 +149,7 @@ pub fn service_for(e: &EntityState, action: Action) -> Option<ServiceCall> {
             let step_by = e.attr_f64("step").unwrap_or(1.0);
             let min = e.attr_f64("min").unwrap_or(f64::MIN);
             let max = e.attr_f64("max").unwrap_or(f64::MAX);
-            let v = step(cur, action == Increase, step_by, min, max);
+            let v = step(cur, action == Increase, step_by, min, max)?;
             Some(call("set_value").with("value", v))
         }
 
@@ -183,11 +186,16 @@ fn supports_color_temp(e: &EntityState) -> bool {
 }
 
 /// Step `cur` up or down, snapping to the step grid and clamping to `[min, max]`.
-fn step(cur: f64, up: bool, by: f64, min: f64, max: f64) -> f64 {
+/// `None` if the entity reports a step or range that can't be used (zero or negative step,
+/// min above max, NaN).
+fn step(cur: f64, up: bool, by: f64, min: f64, max: f64) -> Option<f64> {
+    if !(by > 0.0 && by.is_finite() && cur.is_finite() && min <= max) {
+        return None;
+    }
     let v = if up { cur + by } else { cur - by };
     let snapped = (v / by).round() * by;
     // Keep float noise like 21.499999 out of the service call.
-    ((snapped.clamp(min, max)) * 1000.0).round() / 1000.0
+    Some(((snapped.clamp(min, max)) * 1000.0).round() / 1000.0)
 }
 
 fn cycle<'a>(options: &[&'a str], current: &str) -> Option<&'a str> {
@@ -363,6 +371,18 @@ mod tests {
             service_for(&num, Action::Increase).unwrap().data["value"],
             5.0
         );
+
+        // Bad attributes from an integration must not panic or send NaN.
+        let zero_step = ent("number.z", "1", json!({"step": 0, "min": 0, "max": 5}));
+        assert!(service_for(&zero_step, Action::Increase).is_none());
+        let inverted = ent("number.i", "1", json!({"step": 1, "min": 5, "max": 0}));
+        assert!(service_for(&inverted, Action::Increase).is_none());
+        let light = ent(
+            "light.l",
+            "on",
+            json!({"min_color_temp_kelvin": 6500, "max_color_temp_kelvin": 2000}),
+        );
+        assert!(service_for(&light, Action::SecondaryUp).is_none());
 
         let sensor = ent("sensor.t", "on", json!({}));
         assert!(service_for(&sensor, Action::Primary).is_none());
