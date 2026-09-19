@@ -11,7 +11,7 @@ use crate::ha::actions::{self, Action};
 use crate::ha::client::{ConnStatus, HaCommand, HaEvent};
 use crate::ha::types::{HistoryPoint, LogbookEntry, ServiceCall};
 use crate::search::Fuzzy;
-use crate::store::{GroupBy, Store};
+use crate::store::{Group, GroupBy, Store};
 
 const TOAST_TTL: Duration = Duration::from_secs(4);
 const LOGBOOK_STALE: Duration = Duration::from_secs(60);
@@ -82,6 +82,8 @@ pub struct HistoryView {
     pub unit: Option<String>,
     pub points: Option<Vec<HistoryPoint>>,
     pub error: Option<String>,
+    /// Live changes that arrived while `points` was still loading.
+    live: Vec<HistoryPoint>,
 }
 
 #[derive(Debug, Default)]
@@ -129,7 +131,14 @@ pub struct App {
     pub focus: Focus,
     pub mode: Mode,
     pub group_by: GroupBy,
+    /// Selected sidebar group (`None` = "All"). Selection is kept by identity, so live
+    /// changes that add or reorder rows never move it to another group or entity;
+    /// `group_state` and `list_states` hold the derived row, and the last position as a
+    /// fallback when the selected item disappears.
+    group_key: Option<String>,
     pub group_state: ListState,
+    /// Selected entity per entity-list tab (`None` = nothing picked yet: use the row).
+    list_sel: [Option<String>; 3],
     /// One table state per entity-list tab.
     pub list_states: [TableState; 3],
     pub filter: String,
@@ -152,7 +161,9 @@ impl App {
             focus: Focus::List,
             mode: Mode::Normal,
             group_by: GroupBy::default(),
+            group_key: None,
             group_state: ListState::default().with_selected(Some(0)),
+            list_sel: Default::default(),
             list_states: Default::default(),
             filter: String::new(),
             palette: Palette::default(),
@@ -203,29 +214,81 @@ impl App {
             .collect()
     }
 
-    fn selected_group_key(&self) -> Option<String> {
+    fn selected_group_key(&mut self) -> Option<String> {
         let groups = self.store.groups(self.group_by);
-        let i = self
-            .group_state
-            .selected()
-            .unwrap_or(0)
-            .min(groups.len().saturating_sub(1));
-        groups.get(i).and_then(|g| g.key.clone())
+        self.sync_groups(&groups);
+        self.group_key.clone()
     }
 
-    pub fn list_state(&mut self) -> &mut TableState {
-        let i = match self.tab {
+    /// Point the sidebar row at the selected group. If that group is gone, keep the row
+    /// position and select whatever group is there now. Returns the row.
+    pub fn sync_groups(&mut self, groups: &[Group]) -> usize {
+        let row = groups
+            .iter()
+            .position(|g| g.key == self.group_key)
+            .unwrap_or_else(|| {
+                let last = groups.len().saturating_sub(1);
+                self.group_state.selected().unwrap_or(0).min(last)
+            });
+        self.group_state.select(Some(row));
+        if let Some(g) = groups.get(row) {
+            self.group_key = g.key.clone();
+        }
+        row
+    }
+
+    fn list_slot(&self) -> usize {
+        match self.tab {
             Tab::Scenes => 1,
             Tab::Automations => 2,
             _ => 0,
-        };
+        }
+    }
+
+    pub fn list_state(&mut self) -> &mut TableState {
+        let i = self.list_slot();
         &mut self.list_states[i]
+    }
+
+    /// Point the current list's row at the selected entity. If that entity is gone, keep
+    /// the row position and select whatever entity is there now. Returns the row.
+    pub fn sync_list(&mut self, ids: &[String]) -> Option<usize> {
+        let i = self.list_slot();
+        let row = match self.list_sel[i]
+            .as_ref()
+            .and_then(|id| ids.iter().position(|x| x == id))
+        {
+            Some(row) => Some(row),
+            None if ids.is_empty() => None,
+            None => Some(
+                self.list_states[i]
+                    .selected()
+                    .unwrap_or(0)
+                    .min(ids.len() - 1),
+            ),
+        };
+        self.list_states[i].select(row);
+        self.list_sel[i] = row.map(|r| ids[r].clone());
+        row
     }
 
     pub fn selected_id(&mut self) -> Option<String> {
         let ids = self.list_ids();
-        let i = self.list_state().selected().unwrap_or(0);
-        ids.get(i.min(ids.len().saturating_sub(1))).cloned()
+        let row = self.sync_list(&ids)?;
+        Some(ids[row].clone())
+    }
+
+    /// Select the first row of the current list.
+    fn reset_list(&mut self) {
+        let i = self.list_slot();
+        self.list_states[i].select(Some(0));
+        self.list_sel[i] = None;
+    }
+
+    /// Select the "All" group.
+    fn reset_group(&mut self) {
+        self.group_state.select(Some(0));
+        self.group_key = None;
     }
 
     // ----- Events -----------------------------------------------------------
@@ -247,6 +310,8 @@ impl App {
                 self.status_since = Instant::now();
             }
             HaEvent::Snapshot(snap) => {
+                // Removals can move the selection to a fallback row: make sure that row is current.
+                self.selected_id();
                 self.store.load(snap);
                 if self.tab == Tab::Logbook {
                     self.fetch_logbook();
@@ -258,13 +323,18 @@ impl App {
             } => {
                 if let (Some(h), Some(ns)) = (&mut self.history, &new_state)
                     && h.entity_id == entity_id
-                    && let Some(points) = &mut h.points
-                    && points.last().is_none_or(|p| p.state != ns.state)
                 {
-                    points.push(HistoryPoint {
+                    let p = HistoryPoint {
                         when: ns.last_changed.unwrap_or_else(Utc::now),
                         state: ns.state.clone(),
-                    });
+                    };
+                    match &mut h.points {
+                        Some(points) => push_live(points, p),
+                        None => h.live.push(p),
+                    }
+                }
+                if new_state.is_none() {
+                    self.selected_id();
                 }
                 self.store.apply_change(&entity_id, new_state);
             }
@@ -276,7 +346,11 @@ impl App {
                 if let Some(h) = &mut self.history
                     && h.entity_id == entity_id
                 {
-                    h.points = Some(points);
+                    let live = std::mem::take(&mut h.live);
+                    let points = h.points.insert(points);
+                    for p in live {
+                        push_live(points, p);
+                    }
                     h.error = None;
                 }
             }
@@ -287,9 +361,13 @@ impl App {
                     h.error = Some(error);
                 }
             }
-            HaEvent::Logbook(r) => {
+            HaEvent::Logbook { entity_id, result } => {
+                // A reply for a filter that has since changed: the newer request is still coming.
+                if entity_id != self.logbook.entity {
+                    return;
+                }
                 self.logbook.loading = false;
-                match r {
+                match result {
                     Ok(mut entries) => {
                         entries.sort_by_key(|e| std::cmp::Reverse(e.when));
                         self.logbook.entries = entries;
@@ -363,7 +441,7 @@ impl App {
             }
             KeyCode::Esc if !self.filter.is_empty() => {
                 self.filter.clear();
-                self.list_state().select(Some(0));
+                self.reset_list();
             }
             KeyCode::Char(c @ '1'..='4') => self.set_tab(Tab::ALL[c as usize - '1' as usize]),
             KeyCode::Tab => self.set_tab(Tab::ALL[(self.tab.index() + 1) % 4]),
@@ -388,8 +466,6 @@ impl App {
             }
             KeyCode::Char('a') => {
                 self.store.show_all = !self.store.show_all;
-                self.group_state.select(Some(0));
-                self.list_state().select(Some(0));
                 let msg = if self.store.show_all {
                     "Showing all entities (incl. hidden & system)"
                 } else {
@@ -399,8 +475,7 @@ impl App {
             }
             KeyCode::Char('g') if self.tab == Tab::Entities => {
                 self.group_by = self.group_by.toggle();
-                self.group_state.select(Some(0));
-                self.list_state().select(Some(0));
+                self.reset_group();
             }
             KeyCode::Char('h') | KeyCode::Left if self.tab == Tab::Entities => {
                 self.focus = Focus::Groups
@@ -442,13 +517,13 @@ impl App {
             KeyCode::Enter => self.mode = Mode::Normal,
             KeyCode::Backspace => {
                 self.filter.pop();
-                self.list_state().select(Some(0));
+                self.reset_list();
             }
             KeyCode::Down => self.move_selection(1),
             KeyCode::Up => self.move_selection(-1),
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.filter.push(c);
-                self.list_state().select(Some(0));
+                self.reset_list();
             }
             _ => {}
         }
@@ -510,26 +585,43 @@ impl App {
     }
 
     fn move_selection(&mut self, delta: isize) {
-        let (len, state): (usize, &mut dyn Selectable) = match (self.tab, self.focus) {
-            (Tab::Logbook, _) => (self.logbook.entries.len(), &mut self.logbook.state),
+        let step = |cur: usize, len: usize| {
+            (cur as isize)
+                .saturating_add(delta)
+                .clamp(0, len as isize - 1) as usize
+        };
+        match (self.tab, self.focus) {
+            (Tab::Logbook, _) => {
+                let len = self.logbook.entries.len();
+                let next = self
+                    .logbook
+                    .state
+                    .selected()
+                    .filter(|_| len > 0)
+                    .map(|cur| step(cur.min(len - 1), len))
+                    .or((len > 0).then_some(0));
+                self.logbook.state.select(next);
+            }
             (Tab::Entities, Focus::Groups) => {
-                let len = self.store.groups(self.group_by).len();
-                (len, &mut self.group_state)
+                let groups = self.store.groups(self.group_by);
+                let cur = self.sync_groups(&groups);
+                let next = step(cur, groups.len());
+                if next != cur {
+                    self.group_state.select(Some(next));
+                    self.group_key = groups[next].key.clone();
+                    self.reset_list();
+                }
             }
             _ => {
-                let len = self.list_ids().len();
-                (len, self.list_state())
+                let ids = self.list_ids();
+                let Some(cur) = self.sync_list(&ids) else {
+                    return;
+                };
+                let next = step(cur, ids.len());
+                let i = self.list_slot();
+                self.list_states[i].select(Some(next));
+                self.list_sel[i] = Some(ids[next].clone());
             }
-        };
-        if len == 0 {
-            state.set(None);
-            return;
-        }
-        let cur = state.get().unwrap_or(0).min(len - 1) as isize;
-        let next = (cur.saturating_add(delta)).clamp(0, len as isize - 1) as usize;
-        state.set(Some(next));
-        if self.tab == Tab::Entities && self.focus == Focus::Groups {
-            self.list_state().select(Some(0));
         }
     }
 
@@ -565,6 +657,7 @@ impl App {
             entity_id: entity_id.clone(),
             points: None,
             error: None,
+            live: Vec::new(),
         });
         self.mode = Mode::History;
         let since = Utc::now() - chrono::Duration::hours(HISTORY_HOURS);
@@ -664,7 +757,7 @@ impl App {
             PaletteAction::Tab(t) => self.set_tab(t),
             PaletteAction::ToggleGroupBy => {
                 self.group_by = self.group_by.toggle();
-                self.group_state.select(Some(0));
+                self.reset_group();
             }
             PaletteAction::Resync => {
                 let _ = self.cmds.send(HaCommand::Resync);
@@ -691,9 +784,22 @@ impl App {
     pub fn go_to(&mut self, id: &str) {
         self.set_tab(Tab::Entities);
         self.focus = Focus::List;
-        self.group_state.select(Some(0));
-        let pos = self.list_ids().iter().position(|x| x == id);
-        self.list_state().select(pos.or(Some(0)));
+        self.reset_group();
+        self.reset_list();
+        let i = self.list_slot();
+        self.list_sel[i] = Some(id.to_string());
+        self.selected_id();
+    }
+}
+
+/// Append a live change to a history, skipping attribute-only updates and anything the
+/// history already covers.
+fn push_live(points: &mut Vec<HistoryPoint>, p: HistoryPoint) {
+    if points
+        .last()
+        .is_none_or(|last| last.state != p.state && last.when <= p.when)
+    {
+        points.push(p);
     }
 }
 
@@ -713,30 +819,6 @@ fn key_action(code: KeyCode) -> Option<Action> {
         KeyCode::Char('p') => Action::Prev,
         _ => return None,
     })
-}
-
-/// Uniform access to ratatui's `ListState` and `TableState` selection.
-trait Selectable {
-    fn get(&self) -> Option<usize>;
-    fn set(&mut self, i: Option<usize>);
-}
-
-impl Selectable for ListState {
-    fn get(&self) -> Option<usize> {
-        self.selected()
-    }
-    fn set(&mut self, i: Option<usize>) {
-        self.select(i)
-    }
-}
-
-impl Selectable for TableState {
-    fn get(&self) -> Option<usize> {
-        self.selected()
-    }
-    fn set(&mut self, i: Option<usize>) {
-        self.select(i)
-    }
 }
 
 #[cfg(test)]
@@ -833,6 +915,135 @@ mod tests {
         }
         press(&mut app, KeyCode::Char('4'));
         assert!(matches!(rx.try_recv().unwrap(), HaCommand::Logbook { .. }));
+    }
+
+    fn set(app: &mut App, id: &str, name: &str) {
+        let st = serde_json::from_value(
+            json!({"entity_id": id, "state": "on", "attributes": {"friendly_name": name}}),
+        )
+        .unwrap();
+        app.on_ha_event(HaEvent::StateChanged {
+            entity_id: id.into(),
+            new_state: Some(st),
+        });
+    }
+
+    fn remove(app: &mut App, id: &str) {
+        app.on_ha_event(HaEvent::StateChanged {
+            entity_id: id.into(),
+            new_state: None,
+        });
+    }
+
+    #[test]
+    fn selection_survives_insertions_and_renames() {
+        let (mut app, _rx) = app();
+        app.go_to("light.kitchen");
+        assert_eq!(app.selected_id().as_deref(), Some("light.kitchen"));
+        // Sorts before the selection: the row index shifts, the selected entity must not.
+        set(&mut app, "light.aaa", "Aaa");
+        assert_eq!(app.selected_id().as_deref(), Some("light.kitchen"));
+        set(&mut app, "light.kitchen", "Zzz Kitchen");
+        assert_eq!(app.selected_id().as_deref(), Some("light.kitchen"));
+        press(&mut app, KeyCode::Up);
+        assert_ne!(app.selected_id().as_deref(), Some("light.kitchen"));
+    }
+
+    #[test]
+    fn deleted_selection_falls_back_to_same_row() {
+        let (mut app, _rx) = app();
+        // Sorted: Bed Lamp, Front Door, Kitchen Light, Movie, Night.
+        app.go_to("lock.front");
+        remove(&mut app, "lock.front");
+        assert_eq!(app.selected_id().as_deref(), Some("light.kitchen"));
+        remove(&mut app, "light.kitchen");
+        remove(&mut app, "scene.movie");
+        remove(&mut app, "automation.night");
+        assert_eq!(app.selected_id().as_deref(), Some("light.bed"));
+        remove(&mut app, "light.bed");
+        assert_eq!(app.selected_id(), None);
+    }
+
+    #[test]
+    fn selection_kept_when_toggling_show_all() {
+        let (mut app, _rx) = app();
+        app.go_to("scene.movie");
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(app.selected_id().as_deref(), Some("scene.movie"));
+    }
+
+    #[test]
+    fn group_selection_survives_new_groups() {
+        let (mut app, _rx) = app();
+        press(&mut app, KeyCode::Char('g')); // group by domain: All, automation, light, lock, scene
+        press(&mut app, KeyCode::Char('h'));
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.selected_group_key().as_deref(), Some("lock"));
+        set(&mut app, "fan.attic", "Attic Fan"); // new "fan" group sorts before "lock"
+        assert_eq!(app.selected_group_key().as_deref(), Some("lock"));
+        assert_eq!(app.list_ids(), vec!["lock.front"]);
+        // The group disappears: fall back to the group now in that row.
+        remove(&mut app, "lock.front");
+        assert_eq!(app.selected_group_key().as_deref(), Some("scene"));
+    }
+
+    #[test]
+    fn stale_logbook_reply_is_ignored() {
+        let (mut app, _rx) = app();
+        app.logbook.entity = Some("light.bed".into());
+        app.logbook.loading = true;
+        let entry = |id: &str| {
+            LogbookEntry::from_value(&json!({"when": 1.0, "entity_id": id, "state": "on"})).unwrap()
+        };
+        app.on_ha_event(HaEvent::Logbook {
+            entity_id: None,
+            result: Ok(vec![entry("light.kitchen")]),
+        });
+        assert!(app.logbook.loading);
+        assert!(app.logbook.entries.is_empty());
+        app.on_ha_event(HaEvent::Logbook {
+            entity_id: Some("light.bed".into()),
+            result: Ok(vec![entry("light.bed")]),
+        });
+        assert!(!app.logbook.loading);
+        assert_eq!(app.logbook.entries.len(), 1);
+    }
+
+    #[test]
+    fn history_keeps_changes_made_while_loading() {
+        let (mut app, mut rx) = app();
+        app.go_to("light.bed");
+        press(&mut app, KeyCode::Char('H'));
+        assert!(matches!(rx.try_recv().unwrap(), HaCommand::History { .. }));
+        let ns = serde_json::from_value(
+            json!({"entity_id": "light.bed", "state": "off", "last_changed": Utc::now()}),
+        )
+        .unwrap();
+        app.on_ha_event(HaEvent::StateChanged {
+            entity_id: "light.bed".into(),
+            new_state: Some(ns),
+        });
+        let earlier = HistoryPoint {
+            when: Utc::now() - chrono::Duration::hours(1),
+            state: "on".into(),
+        };
+        app.on_ha_event(HaEvent::History {
+            entity_id: "light.bed".into(),
+            points: vec![earlier],
+        });
+        let states: Vec<_> = app
+            .history
+            .as_ref()
+            .unwrap()
+            .points
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|p| p.state.as_str())
+            .collect();
+        assert_eq!(states, vec!["on", "off"]);
     }
 
     #[test]

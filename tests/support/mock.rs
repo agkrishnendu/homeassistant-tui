@@ -24,6 +24,12 @@ struct Inner {
     /// Outgoing channels of authenticated connections with a state_changed subscription.
     subscribers: Vec<(u64, mpsc::UnboundedSender<Message>)>,
     calls: Vec<(String, String, Value)>,
+    /// Wait this long before accepting a token.
+    auth_delay: std::time::Duration,
+    /// Command types that are received but never answered.
+    silenced: Vec<String>,
+    /// Type of every command received after auth, in order.
+    received: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -64,6 +70,25 @@ impl MockHa {
 
     pub fn url(&self) -> String {
         format!("http://{}", self.addr)
+    }
+
+    /// Wait `d` before answering each auth message (to exercise slow handshakes).
+    pub fn delay_auth(&self, d: std::time::Duration) {
+        self.inner.lock().unwrap().auth_delay = d;
+    }
+
+    /// Accept but never answer commands of this type (e.g. `"call_service"`).
+    pub fn silence(&self, command_type: &str) {
+        self.inner
+            .lock()
+            .unwrap()
+            .silenced
+            .push(command_type.into());
+    }
+
+    /// Types of all commands received so far (after auth).
+    pub fn received(&self) -> Vec<String> {
+        self.inner.lock().unwrap().received.clone()
     }
 
     /// Drop every open connection (to exercise reconnects).
@@ -125,6 +150,8 @@ impl MockHa {
                 continue;
             };
             if !authed {
+                let delay = self.inner.lock().unwrap().auth_delay;
+                tokio::time::sleep(delay).await;
                 if v["type"] == "auth" && v["access_token"] == self.token.as_str() {
                     authed = true;
                     send(json!({"type": "auth_ok", "ha_version": VERSION}));
@@ -138,7 +165,15 @@ impl MockHa {
             let id = v["id"].as_u64().unwrap_or(0);
             let ok = |result: Value| json!({"id": id, "type": "result", "success": true, "result": result});
             let fail = |code: &str, message: &str| json!({"id": id, "type": "result", "success": false, "error": {"code": code, "message": message}});
-            match v["type"].as_str().unwrap_or("") {
+            let kind = v["type"].as_str().unwrap_or("");
+            {
+                let mut inner = self.inner.lock().unwrap();
+                inner.received.push(kind.into());
+                if inner.silenced.iter().any(|t| t == kind) {
+                    continue;
+                }
+            }
+            match kind {
                 "ping" => send(json!({"id": id, "type": "pong"})),
                 "subscribe_events" => {
                     self.inner
