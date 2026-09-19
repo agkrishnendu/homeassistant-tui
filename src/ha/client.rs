@@ -2,16 +2,26 @@
 //!
 //! The UI sends [`HaCommand`]s and receives [`HaEvent`]s; it never touches the socket.
 //! The actor reconnects with exponential backoff and re-bootstraps on every connection.
+//!
+//! Every command gets exactly one outcome. Commands are never held back and replayed on a
+//! later connection: while disconnected, connecting or authenticating they are rejected, and
+//! service calls are also rejected until the state mirror is loaded. Requests still in
+//! flight when a connection ends, or that go unanswered for too long, are reported as
+//! failed. For service calls the outcome is then unknown, since Home Assistant may already
+//! have run them.
 
 use std::collections::HashMap;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
 use serde_json::{Value, json};
+use tokio::net::TcpStream;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
-use tokio::time::{Instant, MissedTickBehavior, interval, sleep_until};
+use tokio::time::{Instant, MissedTickBehavior, interval, sleep_until, timeout};
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use super::types::{
     Area, DeviceRegistryEntry, EntityRegistryEntry, EntityState, HistoryPoint, LogbookEntry,
@@ -21,6 +31,31 @@ use super::types::{
 const PING_EVERY: Duration = Duration::from_secs(30);
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
+type WsTx = SplitSink<Ws, Message>;
+type WsRx = SplitStream<Ws>;
+
+/// How long to wait on Home Assistant before giving up.
+#[derive(Debug, Clone, Copy)]
+pub struct Timeouts {
+    /// Opening the connection plus the auth handshake.
+    pub connect: Duration,
+    /// The reply to a single request.
+    pub request: Duration,
+    /// Writing a single message to the socket.
+    pub write: Duration,
+}
+
+impl Default for Timeouts {
+    fn default() -> Self {
+        Self {
+            connect: Duration::from_secs(15),
+            request: Duration::from_secs(30),
+            write: Duration::from_secs(10),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConnStatus {
@@ -65,7 +100,11 @@ pub enum HaEvent {
         entity_id: String,
         error: String,
     },
-    Logbook(Result<Vec<LogbookEntry>, String>),
+    Logbook {
+        /// The entity filter the request was made with.
+        entity_id: Option<String>,
+        result: Result<Vec<LogbookEntry>, String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -95,7 +134,20 @@ enum Pending {
     Subscribe,
     Service(String),
     History(String),
-    Logbook,
+    Logbook(Option<String>),
+}
+
+impl Pending {
+    fn is_bootstrap(&self) -> bool {
+        matches!(
+            self,
+            Pending::States
+                | Pending::Areas
+                | Pending::Devices
+                | Pending::Entities
+                | Pending::Subscribe
+        )
+    }
 }
 
 enum SessionEnd {
@@ -110,13 +162,24 @@ enum SessionEnd {
 pub async fn run(
     ws_url: String,
     token: String,
+    cmds: UnboundedReceiver<HaCommand>,
+    events: UnboundedSender<HaEvent>,
+) {
+    run_with(ws_url, token, Timeouts::default(), cmds, events).await
+}
+
+/// [`run`] with custom timeouts.
+pub async fn run_with(
+    ws_url: String,
+    token: String,
+    timeouts: Timeouts,
     mut cmds: UnboundedReceiver<HaCommand>,
     events: UnboundedSender<HaEvent>,
 ) {
     let mut backoff = BACKOFF_MIN;
     loop {
         let _ = events.send(HaEvent::Status(ConnStatus::Connecting));
-        let (end, was_connected) = session(&ws_url, &token, &mut cmds, &events).await;
+        let (end, was_connected) = session(&ws_url, &token, timeouts, &mut cmds, &events).await;
         match end {
             SessionEnd::Shutdown => return,
             SessionEnd::AuthFailed(msg) => {
@@ -167,58 +230,134 @@ fn reject(cmd: &HaCommand, events: &UnboundedSender<HaEvent>, why: &str) {
             entity_id: entity_id.clone(),
             error: why.into(),
         },
-        HaCommand::Logbook { .. } => HaEvent::Logbook(Err(why.into())),
+        HaCommand::Logbook { entity_id, .. } => HaEvent::Logbook {
+            entity_id: entity_id.clone(),
+            result: Err(why.into()),
+        },
         HaCommand::Resync => return,
     };
     let _ = events.send(ev);
+}
+
+/// Report a request that will never get its reply.
+fn fail(kind: Pending, events: &UnboundedSender<HaEvent>, why: &str) {
+    let ev = match kind {
+        Pending::Service(label) => HaEvent::ServiceResult {
+            label,
+            result: Err(format!("{why}; it may or may not have run")),
+        },
+        Pending::History(entity_id) => HaEvent::HistoryFailed {
+            entity_id,
+            error: why.into(),
+        },
+        Pending::Logbook(entity_id) => HaEvent::Logbook {
+            entity_id,
+            result: Err(why.into()),
+        },
+        _ => return,
+    };
+    let _ = events.send(ev);
+}
+
+async fn write(tx: &mut WsTx, body: String, within: Duration) -> Result<(), String> {
+    match timeout(within, tx.send(Message::text(body))).await {
+        Ok(r) => r.map_err(|e| e.to_string()),
+        Err(_) => Err("timed out writing to Home Assistant".into()),
+    }
 }
 
 /// Returns why the session ended and whether authentication had succeeded.
 async fn session(
     ws_url: &str,
     token: &str,
+    t: Timeouts,
     cmds: &mut UnboundedReceiver<HaCommand>,
     events: &UnboundedSender<HaEvent>,
 ) -> (SessionEnd, bool) {
-    let ws = match tokio_tungstenite::connect_async(ws_url).await {
-        Ok((ws, _)) => ws,
-        Err(e) => return (SessionEnd::Error(format!("connect: {e}")), false),
-    };
-    let (mut tx, mut rx) = ws.split();
-
-    // --- Auth handshake ---------------------------------------------------
-    let version = loop {
-        let msg = match rx.next().await {
-            Some(Ok(Message::Text(t))) => t,
-            Some(Ok(Message::Close(_))) | None => {
-                return (SessionEnd::Error("closed during auth".into()), false);
-            }
-            Some(Ok(_)) => continue,
-            Some(Err(e)) => return (SessionEnd::Error(e.to_string()), false),
-        };
-        let v: Value = match serde_json::from_str(&msg) {
-            Ok(v) => v,
-            Err(e) => return (SessionEnd::Error(format!("bad auth message: {e}")), false),
-        };
-        match v["type"].as_str() {
-            Some("auth_required") => {
-                let auth = json!({"type": "auth", "access_token": token}).to_string();
-                if let Err(e) = tx.send(Message::text(auth)).await {
-                    return (SessionEnd::Error(e.to_string()), false);
-                }
-            }
-            Some("auth_ok") => break v["ha_version"].as_str().unwrap_or("?").to_string(),
-            Some("auth_invalid") => {
-                let m = v["message"].as_str().unwrap_or("invalid token").to_string();
-                return (SessionEnd::AuthFailed(m), false);
-            }
-            _ => {}
+    // Keep answering commands while connecting: anything left queued would run whenever a
+    // slow connection finally completes, possibly minutes after the key press.
+    let handshake = timeout(t.connect, handshake(ws_url, token, t.write));
+    tokio::pin!(handshake);
+    let (mut tx, mut rx, version) = loop {
+        tokio::select! {
+            r = &mut handshake => match r {
+                Ok(Ok(conn)) => break conn,
+                Ok(Err(end)) => return (end, false),
+                Err(_) => return (SessionEnd::Error("timed out connecting".into()), false),
+            },
+            cmd = cmds.recv() => match cmd {
+                None => return (SessionEnd::Shutdown, false),
+                Some(HaCommand::Resync) => {}
+                Some(cmd) => reject(&cmd, events, "not connected"),
+            },
         }
     };
     let _ = events.send(HaEvent::Status(ConnStatus::Connected { version }));
 
-    // --- Bootstrap ----------------------------------------------------------
     let mut req = Requests::default();
+    let end = serve(&mut tx, &mut rx, &mut req, t, cmds, events).await;
+    let why = match end {
+        SessionEnd::Resync => "cancelled by resync",
+        _ => "connection lost",
+    };
+    for (kind, _) in req.pending.into_values() {
+        fail(kind, events, why);
+    }
+    (end, true)
+}
+
+/// Open the socket and authenticate. Returns the socket halves and the HA version.
+async fn handshake(
+    ws_url: &str,
+    token: &str,
+    write_timeout: Duration,
+) -> Result<(WsTx, WsRx, String), SessionEnd> {
+    let (ws, _) = tokio_tungstenite::connect_async(ws_url)
+        .await
+        .map_err(|e| SessionEnd::Error(format!("connect: {e}")))?;
+    let (mut tx, mut rx) = ws.split();
+    loop {
+        let msg = match rx.next().await {
+            Some(Ok(Message::Text(t))) => t,
+            Some(Ok(Message::Close(_))) | None => {
+                return Err(SessionEnd::Error("closed during auth".into()));
+            }
+            Some(Ok(_)) => continue,
+            Some(Err(e)) => return Err(SessionEnd::Error(e.to_string())),
+        };
+        let v: Value = serde_json::from_str(&msg)
+            .map_err(|e| SessionEnd::Error(format!("bad auth message: {e}")))?;
+        match v["type"].as_str() {
+            Some("auth_required") => {
+                let auth = json!({"type": "auth", "access_token": token}).to_string();
+                write(&mut tx, auth, write_timeout)
+                    .await
+                    .map_err(SessionEnd::Error)?;
+            }
+            Some("auth_ok") => {
+                let version = v["ha_version"].as_str().unwrap_or("?").to_string();
+                return Ok((tx, rx, version));
+            }
+            Some("auth_invalid") => {
+                let m = v["message"].as_str().unwrap_or("invalid token").to_string();
+                return Err(SessionEnd::AuthFailed(m));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Bootstrap, then relay commands and events until the connection ends. Requests still
+/// pending on return are left in `req` for the caller to fail.
+async fn serve(
+    tx: &mut WsTx,
+    rx: &mut WsRx,
+    req: &mut Requests,
+    t: Timeouts,
+    cmds: &mut UnboundedReceiver<HaCommand>,
+    events: &UnboundedSender<HaEvent>,
+) -> SessionEnd {
+    // --- Bootstrap ----------------------------------------------------------
     let mut snapshot = Snapshot::default();
     let mut bootstrap_left = 4;
     // Subscribe before fetching states so no change slips between the two.
@@ -243,11 +382,13 @@ async fn session(
     ping.set_missed_tick_behavior(MissedTickBehavior::Delay);
     ping.tick().await;
     let mut ping_outstanding: Option<u64> = None;
+    let mut sweep = interval(Duration::from_secs(1));
+    sweep.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     loop {
         for body in req.outbox.drain(..) {
-            if let Err(e) = tx.send(Message::text(body.to_string())).await {
-                return (SessionEnd::Error(e.to_string()), true);
+            if let Err(e) = write(tx, body.to_string(), t.write).await {
+                return SessionEnd::Error(e);
             }
         }
 
@@ -257,11 +398,11 @@ async fn session(
                     Some(Ok(Message::Text(t))) => t,
                     Some(Ok(Message::Close(frame))) => {
                         let why = frame.map(|f| f.reason.to_string()).unwrap_or_default();
-                        return (SessionEnd::Error(format!("server closed connection {why}").trim().into()), true);
+                        return SessionEnd::Error(format!("server closed connection {why}").trim().into());
                     }
-                    None => return (SessionEnd::Error("connection lost".into()), true),
+                    None => return SessionEnd::Error("connection lost".into()),
                     Some(Ok(_)) => continue,
-                    Some(Err(e)) => return (SessionEnd::Error(e.to_string()), true),
+                    Some(Err(e)) => return SessionEnd::Error(e.to_string()),
                 };
                 let Ok(v) = serde_json::from_str::<Value>(&text) else { continue };
                 // HA may coalesce messages into a JSON array.
@@ -286,7 +427,7 @@ async fn session(
                             }
                         }
                         Some("result") => {
-                            let Some(kind) = v["id"].as_u64().and_then(|id| req.pending.remove(&id)) else { continue };
+                            let Some((kind, _)) = v["id"].as_u64().and_then(|id| req.pending.remove(&id)) else { continue };
                             let ok = v["success"].as_bool().unwrap_or(false);
                             let err = || {
                                 v["error"]["message"].as_str().unwrap_or("request failed").to_string()
@@ -295,12 +436,12 @@ async fn session(
                             match kind {
                                 Pending::Subscribe => {
                                     if !ok {
-                                        return (SessionEnd::Error(format!("subscribe failed: {}", err())), true);
+                                        return SessionEnd::Error(format!("subscribe failed: {}", err()));
                                     }
                                 }
                                 Pending::States | Pending::Areas | Pending::Devices | Pending::Entities => {
                                     if !ok {
-                                        return (SessionEnd::Error(format!("bootstrap failed: {}", err())), true);
+                                        return SessionEnd::Error(format!("bootstrap failed: {}", err()));
                                     }
                                     let parsed = match kind {
                                         Pending::States => parse_list(result).map(|l| snapshot.states = l),
@@ -309,7 +450,7 @@ async fn session(
                                         _ => parse_list(result).map(|l| snapshot.entities = l),
                                     };
                                     if let Err(e) = parsed {
-                                        return (SessionEnd::Error(format!("bootstrap parse: {e}")), true);
+                                        return SessionEnd::Error(format!("bootstrap parse: {e}"));
                                     }
                                     bootstrap_left -= 1;
                                     if bootstrap_left == 0 {
@@ -335,8 +476,8 @@ async fn session(
                                     };
                                     let _ = events.send(ev);
                                 }
-                                Pending::Logbook => {
-                                    let r = if ok {
+                                Pending::Logbook(entity_id) => {
+                                    let result = if ok {
                                         Ok(result
                                             .as_array()
                                             .map(|a| a.iter().filter_map(LogbookEntry::from_value).collect())
@@ -344,7 +485,7 @@ async fn session(
                                     } else {
                                         Err(err())
                                     };
-                                    let _ = events.send(HaEvent::Logbook(r));
+                                    let _ = events.send(HaEvent::Logbook { entity_id, result });
                                 }
                             }
                         }
@@ -353,9 +494,14 @@ async fn session(
                 }
             }
             cmd = cmds.recv() => {
-                let Some(cmd) = cmd else { return (SessionEnd::Shutdown, true) };
+                let Some(cmd) = cmd else { return SessionEnd::Shutdown };
+                // Until the snapshot is in, the UI still shows the previous session's states.
+                if bootstrap_left > 0 && matches!(cmd, HaCommand::CallService { .. }) {
+                    reject(&cmd, events, "still loading from Home Assistant");
+                    continue;
+                }
                 match cmd {
-                    HaCommand::Resync => return (SessionEnd::Resync, true),
+                    HaCommand::Resync => return SessionEnd::Resync,
                     HaCommand::CallService { call, label } => {
                         let mut body = json!({
                             "type": "call_service",
@@ -385,18 +531,26 @@ async fn session(
                             "start_time": since.to_rfc3339(),
                             "end_time": Utc::now().to_rfc3339(),
                         });
-                        if let Some(e) = entity_id {
+                        if let Some(e) = &entity_id {
                             body["entity_ids"] = json!([e]);
                         }
-                        req.send(body, Pending::Logbook);
+                        req.send(body, Pending::Logbook(entity_id));
                     }
                 }
             }
             _ = ping.tick() => {
                 if ping_outstanding.is_some() {
-                    return (SessionEnd::Error("ping timed out".into()), true);
+                    return SessionEnd::Error("ping timed out".into());
                 }
                 ping_outstanding = Some(req.send_untracked(json!({"type": "ping"})));
+            }
+            _ = sweep.tick() => {
+                for kind in req.expired(t.request) {
+                    if kind.is_bootstrap() {
+                        return SessionEnd::Error("timed out loading from Home Assistant".into());
+                    }
+                    fail(kind, events, "no reply from Home Assistant");
+                }
             }
         }
     }
@@ -405,15 +559,30 @@ async fn session(
 #[derive(Default)]
 struct Requests {
     next_id: u64,
-    pending: HashMap<u64, Pending>,
+    /// What each outstanding request is waiting for, and when it was sent.
+    pending: HashMap<u64, (Pending, Instant)>,
     outbox: Vec<Value>,
 }
 
 impl Requests {
     fn send(&mut self, body: Value, kind: Pending) -> u64 {
         let id = self.send_untracked(body);
-        self.pending.insert(id, kind);
+        self.pending.insert(id, (kind, Instant::now()));
         id
+    }
+
+    /// Remove and return the requests sent more than `after` ago.
+    fn expired(&mut self, after: Duration) -> Vec<Pending> {
+        let now = Instant::now();
+        let ids: Vec<u64> = self
+            .pending
+            .iter()
+            .filter(|(_, (_, at))| now - *at >= after)
+            .map(|(id, _)| *id)
+            .collect();
+        ids.into_iter()
+            .filter_map(|id| self.pending.remove(&id).map(|(kind, _)| kind))
+            .collect()
     }
 
     fn send_untracked(&mut self, mut body: Value) -> u64 {
@@ -442,9 +611,60 @@ fn parse_state_changed(v: &Value) -> Option<HaEvent> {
     }
     let data = &ev["data"];
     let entity_id = data["entity_id"].as_str()?.to_string();
-    let new_state = serde_json::from_value(data["new_state"].clone()).ok();
+    // Only an explicit null means the entity was removed. A malformed update is dropped, so
+    // the entity keeps its last known state instead of disappearing.
+    let new_state = match data.get("new_state")? {
+        Value::Null => None,
+        v => Some(serde_json::from_value(v.clone()).ok()?),
+    };
     Some(HaEvent::StateChanged {
         entity_id,
         new_state,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event(new_state: Option<Value>) -> Value {
+        let mut data = json!({"entity_id": "light.x"});
+        if let Some(ns) = new_state {
+            data["new_state"] = ns;
+        }
+        json!({"type": "event", "event": {"event_type": "state_changed", "data": data}})
+    }
+
+    #[test]
+    fn state_changed_null_is_removal_and_malformed_is_dropped() {
+        let removed = parse_state_changed(&event(Some(Value::Null)));
+        assert!(matches!(
+            removed,
+            Some(HaEvent::StateChanged {
+                new_state: None,
+                ..
+            })
+        ));
+        let updated =
+            parse_state_changed(&event(Some(json!({"entity_id": "light.x", "state": "on"}))));
+        assert!(matches!(
+            updated,
+            Some(HaEvent::StateChanged {
+                new_state: Some(_),
+                ..
+            })
+        ));
+        assert_eq!(parse_state_changed(&event(Some(json!({"state": 5})))), None);
+        assert_eq!(parse_state_changed(&event(Some(json!("garbage")))), None);
+        assert_eq!(parse_state_changed(&event(None)), None);
+    }
+
+    #[test]
+    fn expired_requests_are_removed() {
+        let mut req = Requests::default();
+        req.send(json!({}), Pending::Logbook(None));
+        assert!(req.expired(Duration::from_secs(60)).is_empty());
+        assert_eq!(req.expired(Duration::ZERO).len(), 1);
+        assert!(req.pending.is_empty());
+    }
 }

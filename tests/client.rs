@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use homeassistant_tui::config::ws_url;
-use homeassistant_tui::ha::client::{self, ConnStatus, HaCommand, HaEvent};
+use homeassistant_tui::ha::client::{self, ConnStatus, HaCommand, HaEvent, Timeouts};
 use homeassistant_tui::ha::types::ServiceCall;
 use support::mock::MockHa;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -17,10 +17,40 @@ async fn connect(
     ha: &MockHa,
     token: &str,
 ) -> (UnboundedSender<HaCommand>, UnboundedReceiver<HaEvent>) {
+    connect_with(ha, token, Timeouts::default()).await
+}
+
+async fn connect_with(
+    ha: &MockHa,
+    token: &str,
+    timeouts: Timeouts,
+) -> (UnboundedSender<HaCommand>, UnboundedReceiver<HaEvent>) {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (ev_tx, ev_rx) = mpsc::unbounded_channel();
-    tokio::spawn(client::run(ws_url(&ha.url()), token.into(), cmd_rx, ev_tx));
+    tokio::spawn(client::run_with(
+        ws_url(&ha.url()),
+        token.into(),
+        timeouts,
+        cmd_rx,
+        ev_tx,
+    ));
     (cmd_tx, ev_rx)
+}
+
+fn toggle_kitchen() -> HaCommand {
+    HaCommand::CallService {
+        call: ServiceCall::new("light", "toggle", "light.kitchen"),
+        label: "toggle kitchen".into(),
+    }
+}
+
+async fn service_error(rx: &mut UnboundedReceiver<HaEvent>) -> String {
+    wait_for(rx, |e| match e {
+        HaEvent::ServiceResult { result: Err(e), .. } => Some(e),
+        HaEvent::ServiceResult { result: Ok(()), .. } => panic!("service call succeeded"),
+        _ => None,
+    })
+    .await
 }
 
 /// Wait for the first event matching `pred`, skipping others.
@@ -155,7 +185,7 @@ async fn history_and_logbook() {
     })
     .unwrap();
     let entries = wait_for(&mut rx, |e| match e {
-        HaEvent::Logbook(r) => Some(r),
+        HaEvent::Logbook { result, .. } => Some(result),
         _ => None,
     })
     .await
@@ -212,4 +242,85 @@ async fn bad_token_stops_and_rejects_commands() {
     .await;
     assert!(r.is_err());
     assert!(ha.calls().is_empty());
+}
+
+#[tokio::test]
+async fn commands_during_handshake_are_rejected_not_replayed() {
+    let ha = MockHa::start(TOKEN, "127.0.0.1:0").await;
+    ha.delay_auth(Duration::from_millis(500));
+    let (tx, mut rx) = connect(&ha, TOKEN).await;
+    tx.send(toggle_kitchen()).unwrap();
+    let err = service_error(&mut rx).await;
+    assert!(err.contains("not connected"), "{err}");
+    wait_for(&mut rx, |e| matches!(e, HaEvent::Snapshot(_)).then_some(())).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(ha.calls().is_empty(), "stale command was replayed");
+}
+
+#[tokio::test]
+async fn in_flight_requests_fail_when_connection_drops() {
+    let ha = MockHa::start(TOKEN, "127.0.0.1:0").await;
+    let (tx, mut rx) = ready(&ha).await;
+    ha.silence("call_service");
+    ha.silence("history/history_during_period");
+    tx.send(toggle_kitchen()).unwrap();
+    tx.send(HaCommand::History {
+        entity_id: "sensor.living_temperature".into(),
+        since: Utc::now(),
+    })
+    .unwrap();
+    // Let both requests reach the server before dropping the connection.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !ha.received().iter().any(|t| t.starts_with("history/")) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("requests never reached the mock");
+    ha.kick_all();
+    // Both get an outcome, in either order.
+    let (mut service, mut history) = (None, false);
+    while service.is_none() || !history {
+        match wait_for(&mut rx, Some).await {
+            HaEvent::ServiceResult { result, .. } => service = Some(result.unwrap_err()),
+            HaEvent::HistoryFailed { entity_id, .. } => {
+                history = entity_id == "sensor.living_temperature"
+            }
+            _ => {}
+        }
+    }
+    let err = service.unwrap();
+    assert!(err.contains("may or may not have run"), "{err}");
+}
+
+#[tokio::test]
+async fn unanswered_request_times_out() {
+    let ha = MockHa::start(TOKEN, "127.0.0.1:0").await;
+    let timeouts = Timeouts {
+        request: Duration::from_millis(500),
+        ..Timeouts::default()
+    };
+    let (tx, mut rx) = connect_with(&ha, TOKEN, timeouts).await;
+    wait_for(&mut rx, |e| matches!(e, HaEvent::Snapshot(_)).then_some(())).await;
+    ha.silence("logbook/get_events");
+    tx.send(HaCommand::Logbook {
+        since: Utc::now(),
+        entity_id: Some("lock.front_door".into()),
+    })
+    .unwrap();
+    let (entity_id, result) = wait_for(&mut rx, |e| match e {
+        HaEvent::Logbook { entity_id, result } => Some((entity_id, result)),
+        _ => None,
+    })
+    .await;
+    assert_eq!(entity_id.as_deref(), Some("lock.front_door"));
+    assert!(result.unwrap_err().contains("no reply"));
+    // The connection itself is still fine.
+    tx.send(toggle_kitchen()).unwrap();
+    wait_for(&mut rx, |e| match e {
+        HaEvent::ServiceResult { result, .. } => Some(result),
+        _ => None,
+    })
+    .await
+    .unwrap();
 }

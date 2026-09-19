@@ -83,10 +83,7 @@ fn render_groups(f: &mut Frame, app: &mut App, area: Rect) {
         } else {
             Style::new()
         });
-    let n = groups.len();
-    if app.group_state.selected().is_some_and(|i| i >= n) {
-        app.group_state.select(Some(n.saturating_sub(1)));
-    }
+    app.sync_groups(&groups);
     f.render_stateful_widget(list, area, &mut app.group_state);
 }
 
@@ -209,15 +206,8 @@ fn render_table(f: &mut Frame, app: &mut App, area: Rect) -> Option<String> {
         .row_highlight_style(theme::selected())
         .column_spacing(1);
 
-    let n = ids.len();
-    let state = app.list_state();
-    match state.selected() {
-        None if n > 0 => state.select(Some(0)),
-        Some(i) if i >= n => state.select(n.checked_sub(1)),
-        _ => {}
-    }
-    let selected = state.selected().and_then(|i| ids.get(i).cloned());
-    f.render_stateful_widget(table, area, state);
+    let selected = app.sync_list(&ids).map(|row| ids[row].clone());
+    f.render_stateful_widget(table, area, app.list_state());
 
     if empty {
         let msg = if app.filter.is_empty() {
