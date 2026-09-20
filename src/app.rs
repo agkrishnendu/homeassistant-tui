@@ -317,6 +317,12 @@ impl App {
                     self.fetch_logbook();
                 }
             }
+            HaEvent::Registry(update) => {
+                // Groups and rows can appear, vanish or move: make the fallback rows current
+                // first so the selection keeps its place by identity.
+                self.selected_id();
+                self.store.apply_registry(update);
+            }
             HaEvent::StateChanged {
                 entity_id,
                 new_state,
@@ -1065,5 +1071,59 @@ mod tests {
             app.history.as_ref().unwrap().points.as_ref().unwrap().len(),
             1
         );
+    }
+
+    #[test]
+    fn registry_update_regroups_and_keeps_selection() {
+        use crate::ha::client::RegistryUpdate;
+        use crate::ha::types::{Area, EntityRegistryEntry};
+
+        let (mut app, _rx) = app();
+        let reg = |id: &str, area: Option<&str>| EntityRegistryEntry {
+            entity_id: id.into(),
+            area_id: area.map(Into::into),
+            device_id: None,
+            hidden_by: None,
+            disabled_by: None,
+            entity_category: None,
+            platform: None,
+        };
+        let area = |id: &str, name: &str| Area {
+            area_id: id.into(),
+            name: name.into(),
+        };
+        app.on_ha_event(HaEvent::Registry(RegistryUpdate::Areas(vec![
+            area("kitchen", "Kitchen"),
+            area("bed", "Bedroom"),
+        ])));
+        app.on_ha_event(HaEvent::Registry(RegistryUpdate::Entities(vec![
+            reg("light.kitchen", Some("kitchen")),
+            reg("light.bed", Some("bed")),
+        ])));
+        assert_eq!(app.store.area_name("light.kitchen"), "Kitchen");
+        assert_eq!(app.store.area_name("light.bed"), "Bedroom");
+
+        // Select the Kitchen group, which holds just the kitchen light.
+        let groups = app.store.groups(app.group_by);
+        let row = groups.iter().position(|g| g.title == "Kitchen").unwrap();
+        app.group_key = groups[row].key.clone();
+        assert_eq!(app.list_ids(), vec!["light.kitchen"]);
+
+        // The light moves to the bedroom and the emptied area is renamed.
+        app.on_ha_event(HaEvent::Registry(RegistryUpdate::Areas(vec![
+            area("kitchen", "Cookery"),
+            area("bed", "Bedroom"),
+        ])));
+        app.on_ha_event(HaEvent::Registry(RegistryUpdate::Entities(vec![
+            reg("light.kitchen", Some("bed")),
+            reg("light.bed", Some("bed")),
+        ])));
+        assert_eq!(app.store.area_name("light.kitchen"), "Bedroom");
+        let groups = app.store.groups(app.group_by);
+        assert!(groups.iter().all(|g| g.title != "Kitchen"));
+        // The selected group is gone: the sidebar row stays valid and the list shows
+        // something instead of a dangling selection.
+        assert!(!app.list_ids().is_empty());
+        assert!(app.group_state.selected().unwrap() < groups.len());
     }
 }
