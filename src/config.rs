@@ -110,13 +110,24 @@ fn shell(cmd: &str) -> Command {
     c
 }
 
+const STDERR_LIMIT: usize = 200;
+
+/// Shorten `s` to at most `max` characters, marking the cut with an ellipsis.
+fn truncate(s: &str, max: usize) -> String {
+    match s.char_indices().nth(max) {
+        Some((i, _)) => format!("{}…", &s[..i]),
+        None => s.to_string(),
+    }
+}
+
 fn run_token_command(cmd: &str) -> Result<String> {
     let out = shell(cmd).output().wrap_err("running token_command")?;
     let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if !out.status.success() || token.is_empty() {
-        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let stderr = truncate(String::from_utf8_lossy(&out.stderr).trim(), STDERR_LIMIT);
+        // The command text is deliberately left out: it may embed the secret itself.
         bail!(
-            "token_command `{cmd}` returned no token ({}{}).\n\
+            "token_command returned no token ({}{}).\n\
              Is the token stored? e.g. secret-tool store --label=\"homeassistant-tui Home Assistant token\" service homeassistant-tui",
             out.status,
             if stderr.is_empty() {
@@ -165,6 +176,30 @@ mod tests {
             ws_url("ws://h:8123/api/websocket"),
             "ws://h:8123/api/websocket"
         );
+    }
+
+    #[test]
+    fn truncate_respects_char_boundaries() {
+        assert_eq!(truncate("short", 10), "short");
+        assert_eq!(truncate("abcdef", 3), "abc…");
+        assert_eq!(truncate("ééééé", 2), "éé…");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_command_error_hides_command_text() {
+        let err = run_token_command("echo s3cret-value >&2; exit 1").unwrap_err();
+        let msg = err.to_string();
+        assert!(!msg.contains("echo"), "{msg}");
+        assert!(msg.contains("token_command"), "{msg}");
+        assert!(
+            msg.contains("s3cret-value"),
+            "stderr should still be shown: {msg}"
+        );
+
+        let long = run_token_command("printf 'x%.0s' $(seq 1 500) >&2; exit 1").unwrap_err();
+        assert!(long.to_string().contains('…'));
+        assert!(long.to_string().len() < 500);
     }
 
     #[test]
