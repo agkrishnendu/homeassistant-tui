@@ -27,6 +27,46 @@ pub enum Action {
     Prev,
 }
 
+/// Bits of the `supported_features` attribute, per domain (HA `*EntityFeature` enums).
+mod feature {
+    pub mod cover {
+        pub const OPEN: u64 = 1;
+        pub const CLOSE: u64 = 2;
+        pub const SET_POSITION: u64 = 4;
+        pub const STOP: u64 = 8;
+    }
+    pub mod valve {
+        pub const OPEN: u64 = 1;
+        pub const CLOSE: u64 = 2;
+        pub const STOP: u64 = 8;
+    }
+    pub mod fan {
+        pub const SET_SPEED: u64 = 1;
+    }
+    pub mod climate {
+        pub const TARGET_TEMPERATURE: u64 = 1;
+    }
+    pub mod lock {
+        pub const OPEN: u64 = 1;
+    }
+    pub mod media_player {
+        pub const PAUSE: u64 = 1;
+        pub const VOLUME_SET: u64 = 4;
+        pub const PREVIOUS_TRACK: u64 = 16;
+        pub const NEXT_TRACK: u64 = 32;
+        pub const TURN_ON: u64 = 128;
+        pub const VOLUME_STEP: u64 = 1024;
+        pub const SELECT_SOURCE: u64 = 2048;
+        pub const STOP: u64 = 4096;
+        pub const PLAY: u64 = 16384;
+    }
+    pub mod vacuum {
+        pub const STOP: u64 = 8;
+        pub const RETURN_HOME: u64 = 16;
+        pub const START: u64 = 8192;
+    }
+}
+
 const BRIGHTNESS_STEP_PCT: i64 = 10;
 const COLOR_TEMP_STEP_K: f64 = 250.0;
 const POSITION_STEP: f64 = 10.0;
@@ -39,11 +79,16 @@ pub fn service_for(e: &EntityState, action: Action) -> Option<ServiceCall> {
 
     match (domain, action) {
         ("light", Primary) => Some(call("toggle")),
-        ("light", Increase) => {
-            Some(call("turn_on").with("brightness_step_pct", BRIGHTNESS_STEP_PCT))
-        }
-        ("light", Decrease) => {
-            Some(call("turn_on").with("brightness_step_pct", -BRIGHTNESS_STEP_PCT))
+        ("light", Increase | Decrease) => {
+            if !supports_brightness(e) {
+                return None;
+            }
+            let pct = if action == Increase {
+                BRIGHTNESS_STEP_PCT
+            } else {
+                -BRIGHTNESS_STEP_PCT
+            };
+            Some(call("turn_on").with("brightness_step_pct", pct))
         }
         ("light", SecondaryUp | SecondaryDown) => {
             if !supports_color_temp(e) {
@@ -74,11 +119,15 @@ pub fn service_for(e: &EntityState, action: Action) -> Option<ServiceCall> {
         }
 
         ("fan", Primary) => Some(call("toggle")),
-        ("fan", Increase | SecondaryUp) => Some(call("increase_speed")),
-        ("fan", Decrease | SecondaryDown) => Some(call("decrease_speed")),
+        ("fan", Increase | SecondaryUp) if supports(e, feature::fan::SET_SPEED) => {
+            Some(call("increase_speed"))
+        }
+        ("fan", Decrease | SecondaryDown) if supports(e, feature::fan::SET_SPEED) => {
+            Some(call("decrease_speed"))
+        }
 
         ("climate", Primary) => Some(call("toggle")),
-        ("climate", Increase | Decrease) => {
+        ("climate", Increase | Decrease) if supports(e, feature::climate::TARGET_TEMPERATURE) => {
             let cur = e.attr_f64("temperature")?;
             let step_by = e.attr_f64("target_temp_step").unwrap_or(0.5);
             let min = e.attr_f64("min_temp").unwrap_or(f64::MIN);
@@ -91,32 +140,54 @@ pub fn service_for(e: &EntityState, action: Action) -> Option<ServiceCall> {
             Some(call("set_hvac_mode").with("hvac_mode", next))
         }
 
-        ("cover", Primary) => Some(call("toggle")),
-        ("cover", Open) => Some(call("open_cover")),
-        ("cover", Close) => Some(call("close_cover")),
-        ("cover", Stop) => Some(call("stop_cover")),
-        ("cover", Increase | Decrease) => {
+        ("cover", Primary) if supports(e, feature::cover::OPEN | feature::cover::CLOSE) => {
+            Some(call("toggle"))
+        }
+        ("cover", Open) if supports(e, feature::cover::OPEN) => Some(call("open_cover")),
+        ("cover", Close) if supports(e, feature::cover::CLOSE) => Some(call("close_cover")),
+        ("cover", Stop) if supports(e, feature::cover::STOP) => Some(call("stop_cover")),
+        ("cover", Increase | Decrease) if supports(e, feature::cover::SET_POSITION) => {
             let cur = e.attr_f64("current_position")?;
             let p = step(cur, action == Increase, POSITION_STEP, 0.0, 100.0)?;
             Some(call("set_cover_position").with("position", p as i64))
         }
 
-        ("valve", Primary) => Some(call("toggle")),
-        ("valve", Open) => Some(call("open_valve")),
-        ("valve", Close) => Some(call("close_valve")),
-        ("valve", Stop) => Some(call("stop_valve")),
+        ("valve", Primary) if supports(e, feature::valve::OPEN | feature::valve::CLOSE) => {
+            Some(call("toggle"))
+        }
+        ("valve", Open) if supports(e, feature::valve::OPEN) => Some(call("open_valve")),
+        ("valve", Close) if supports(e, feature::valve::CLOSE) => Some(call("close_valve")),
+        ("valve", Stop) if supports(e, feature::valve::STOP) => Some(call("stop_valve")),
 
-        ("media_player", Primary) => Some(if e.state == "off" {
-            call("turn_on")
-        } else {
-            call("media_play_pause")
+        ("media_player", Primary) if e.state == "off" => {
+            supports(e, feature::media_player::TURN_ON).then(|| call("turn_on"))
+        }
+        ("media_player", Primary) => supports(
+            e,
+            feature::media_player::PAUSE | feature::media_player::PLAY,
+        )
+        .then(|| call("media_play_pause")),
+        ("media_player", Increase | Decrease) => supports(
+            e,
+            feature::media_player::VOLUME_STEP | feature::media_player::VOLUME_SET,
+        )
+        .then(|| {
+            call(if action == Increase {
+                "volume_up"
+            } else {
+                "volume_down"
+            })
         }),
-        ("media_player", Increase) => Some(call("volume_up")),
-        ("media_player", Decrease) => Some(call("volume_down")),
-        ("media_player", Next) => Some(call("media_next_track")),
-        ("media_player", Prev) => Some(call("media_previous_track")),
-        ("media_player", Stop) => Some(call("media_stop")),
-        ("media_player", CycleMode) => {
+        ("media_player", Next) if supports(e, feature::media_player::NEXT_TRACK) => {
+            Some(call("media_next_track"))
+        }
+        ("media_player", Prev) if supports(e, feature::media_player::PREVIOUS_TRACK) => {
+            Some(call("media_previous_track"))
+        }
+        ("media_player", Stop) if supports(e, feature::media_player::STOP) => {
+            Some(call("media_stop"))
+        }
+        ("media_player", CycleMode) if supports(e, feature::media_player::SELECT_SOURCE) => {
             let src = e.attr_str("source").unwrap_or_default();
             let next = cycle(&e.attr_list("source_list"), src)?;
             Some(call("select_source").with("source", next))
@@ -127,14 +198,13 @@ pub fn service_for(e: &EntityState, action: Action) -> Option<ServiceCall> {
         } else {
             call("lock")
         }),
-        ("lock", Open) => Some(call("open")),
+        ("lock", Open) if supports(e, feature::lock::OPEN) => Some(call("open")),
 
-        ("vacuum", Primary) => Some(if e.state == "cleaning" {
-            call("return_to_base")
-        } else {
-            call("start")
-        }),
-        ("vacuum", Stop) => Some(call("stop")),
+        ("vacuum", Primary) if e.state == "cleaning" => {
+            supports(e, feature::vacuum::RETURN_HOME).then(|| call("return_to_base"))
+        }
+        ("vacuum", Primary) => supports(e, feature::vacuum::START).then(|| call("start")),
+        ("vacuum", Stop) if supports(e, feature::vacuum::STOP) => Some(call("stop")),
 
         ("scene" | "script", Primary) => Some(call("turn_on")),
         ("script", Stop) => Some(call("turn_off")),
@@ -180,9 +250,37 @@ fn is_read_only(domain: &str) -> bool {
     )
 }
 
+/// Whether the entity advertises any of the `flags` in `supported_features`.
+/// An entity that doesn't report the attribute at all is assumed capable, so an unknown
+/// device still gets its controls and Home Assistant remains the judge.
+fn supports(e: &EntityState, flags: u64) -> bool {
+    match e
+        .attributes
+        .get("supported_features")
+        .and_then(Value::as_u64)
+    {
+        Some(bits) => bits & flags != 0,
+        None => true,
+    }
+}
+
+/// `supported_color_modes` when the light reports it.
+fn color_modes(e: &EntityState) -> Option<Vec<&str>> {
+    e.attributes
+        .contains_key("supported_color_modes")
+        .then(|| e.attr_list("supported_color_modes"))
+}
+
+/// Anything beyond plain on/off can be dimmed.
+fn supports_brightness(e: &EntityState) -> bool {
+    color_modes(e).is_none_or(|m| m.iter().any(|m| !matches!(*m, "onoff" | "unknown")))
+}
+
 fn supports_color_temp(e: &EntityState) -> bool {
-    e.attr_list("supported_color_modes").contains(&"color_temp")
-        || e.attributes.contains_key("color_temp_kelvin")
+    match color_modes(e) {
+        Some(modes) => modes.contains(&"color_temp"),
+        None => e.attributes.contains_key("color_temp_kelvin"),
+    }
 }
 
 /// Step `cur` up or down, snapping to the step grid and clamping to `[min, max]`.
@@ -298,6 +396,154 @@ mod tests {
         assert_eq!(ct.data["color_temp_kelvin"], 6500);
         let plain = ent("light.p", "on", json!({"supported_color_modes": ["onoff"]}));
         assert!(service_for(&plain, Action::SecondaryUp).is_none());
+    }
+
+    #[test]
+    fn light_brightness_needs_more_than_onoff() {
+        let onoff = ent("light.o", "on", json!({"supported_color_modes": ["onoff"]}));
+        assert!(service_for(&onoff, Action::Primary).is_some());
+        assert!(service_for(&onoff, Action::Increase).is_none());
+        assert!(service_for(&onoff, Action::Decrease).is_none());
+        assert!(available(&onoff).iter().all(|(k, _)| *k == "Enter"));
+
+        let dim = ent(
+            "light.d",
+            "on",
+            json!({"supported_color_modes": ["brightness"]}),
+        );
+        assert!(service_for(&dim, Action::Increase).is_some());
+        // Dimmable, but no color temperature.
+        assert!(service_for(&dim, Action::SecondaryUp).is_none());
+
+        // Modes are authoritative when reported, even if a stale attribute lingers.
+        let rgb = ent(
+            "light.r",
+            "on",
+            json!({"supported_color_modes": ["rgb"], "color_temp_kelvin": null}),
+        );
+        assert!(service_for(&rgb, Action::Increase).is_some());
+        assert!(service_for(&rgb, Action::SecondaryUp).is_none());
+
+        // Unknown capabilities keep the controls.
+        let bare = ent("light.b", "on", json!({}));
+        assert!(service_for(&bare, Action::Increase).is_some());
+    }
+
+    #[test]
+    fn cover_controls_follow_supported_features() {
+        // OPEN | CLOSE only: no stop, no position.
+        let basic = ent(
+            "cover.b",
+            "open",
+            json!({"supported_features": 3, "current_position": 40}),
+        );
+        assert!(service_for(&basic, Action::Open).is_some());
+        assert!(service_for(&basic, Action::Close).is_some());
+        assert!(service_for(&basic, Action::Primary).is_some());
+        assert!(service_for(&basic, Action::Stop).is_none());
+        assert!(service_for(&basic, Action::Increase).is_none());
+
+        // OPEN | CLOSE | SET_POSITION | STOP.
+        let full = ent(
+            "cover.f",
+            "open",
+            json!({"supported_features": 15, "current_position": 40}),
+        );
+        assert_eq!(
+            service_for(&full, Action::Increase).unwrap().data["position"],
+            50
+        );
+        assert!(service_for(&full, Action::Stop).is_some());
+
+        let none = ent("cover.n", "open", json!({"supported_features": 0}));
+        assert!(service_for(&none, Action::Primary).is_none());
+        assert!(available(&none).is_empty());
+    }
+
+    #[test]
+    fn media_player_controls_follow_supported_features() {
+        // PAUSE | PREVIOUS_TRACK | NEXT_TRACK | VOLUME_STEP | SELECT_SOURCE
+        let tv = ent(
+            "media_player.tv",
+            "playing",
+            json!({"supported_features": 1 | 16 | 32 | 1024 | 2048, "source_list": ["a", "b"]}),
+        );
+        assert_eq!(
+            service_for(&tv, Action::Primary).unwrap().name(),
+            "media_player.media_play_pause"
+        );
+        assert!(service_for(&tv, Action::Next).is_some());
+        assert!(service_for(&tv, Action::Prev).is_some());
+        assert!(service_for(&tv, Action::Increase).is_some());
+        assert!(service_for(&tv, Action::CycleMode).is_some());
+        assert!(service_for(&tv, Action::Stop).is_none());
+
+        // A speaker that only plays/pauses.
+        let basic = ent(
+            "media_player.s",
+            "playing",
+            json!({"supported_features": 1}),
+        );
+        assert!(service_for(&basic, Action::Primary).is_some());
+        assert!(service_for(&basic, Action::Next).is_none());
+        assert!(service_for(&basic, Action::Prev).is_none());
+        assert!(service_for(&basic, Action::Increase).is_none());
+        assert!(service_for(&basic, Action::CycleMode).is_none());
+
+        // Off and unable to turn on: nothing to do.
+        let off = ent("media_player.o", "off", json!({"supported_features": 1}));
+        assert!(service_for(&off, Action::Primary).is_none());
+        let off_ok = ent("media_player.o", "off", json!({"supported_features": 128}));
+        assert_eq!(
+            service_for(&off_ok, Action::Primary).unwrap().name(),
+            "media_player.turn_on"
+        );
+    }
+
+    #[test]
+    fn fan_climate_lock_vacuum_valve_follow_supported_features() {
+        let fan = ent("fan.f", "on", json!({"supported_features": 8}));
+        assert!(service_for(&fan, Action::Increase).is_none());
+        assert!(service_for(&fan, Action::SecondaryDown).is_none());
+        let fan = ent("fan.f", "on", json!({"supported_features": 1}));
+        assert!(service_for(&fan, Action::Increase).is_some());
+
+        let cl = ent(
+            "climate.c",
+            "heat",
+            json!({"temperature": 20, "supported_features": 2}),
+        );
+        assert!(service_for(&cl, Action::Increase).is_none());
+        let cl = ent(
+            "climate.c",
+            "heat",
+            json!({"temperature": 20, "supported_features": 1}),
+        );
+        assert!(service_for(&cl, Action::Increase).is_some());
+
+        let lock = ent("lock.l", "locked", json!({"supported_features": 0}));
+        assert!(service_for(&lock, Action::Open).is_none());
+        let lock = ent("lock.l", "locked", json!({"supported_features": 1}));
+        assert!(service_for(&lock, Action::Open).is_some());
+
+        // STOP | RETURN_HOME, but not START.
+        let vac = ent("vacuum.v", "docked", json!({"supported_features": 8 | 16}));
+        assert!(service_for(&vac, Action::Primary).is_none());
+        assert!(service_for(&vac, Action::Stop).is_some());
+        let vac = ent(
+            "vacuum.v",
+            "cleaning",
+            json!({"supported_features": 8 | 16}),
+        );
+        assert_eq!(
+            service_for(&vac, Action::Primary).unwrap().name(),
+            "vacuum.return_to_base"
+        );
+
+        let valve = ent("valve.v", "open", json!({"supported_features": 2}));
+        assert!(service_for(&valve, Action::Open).is_none());
+        assert!(service_for(&valve, Action::Close).is_some());
+        assert!(service_for(&valve, Action::Stop).is_none());
     }
 
     #[test]
