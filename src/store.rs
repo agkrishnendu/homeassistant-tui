@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::ha::client::Snapshot;
+use crate::ha::client::{RegistryUpdate, Snapshot};
 use crate::ha::types::{Area, DeviceRegistryEntry, EntityRegistryEntry, EntityState, domain_of};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -85,6 +85,21 @@ impl Store {
             .map(|e| (e.entity_id.clone(), e))
             .collect();
         self.loaded = true;
+    }
+
+    /// Replace one registry with a freshly fetched copy.
+    pub fn apply_registry(&mut self, update: RegistryUpdate) {
+        match update {
+            RegistryUpdate::Areas(l) => {
+                self.areas = l.into_iter().map(|a| (a.area_id.clone(), a)).collect();
+            }
+            RegistryUpdate::Devices(l) => {
+                self.devices = l.into_iter().map(|d| (d.id.clone(), d)).collect();
+            }
+            RegistryUpdate::Entities(l) => {
+                self.registry = l.into_iter().map(|e| (e.entity_id.clone(), e)).collect();
+            }
+        }
     }
 
     pub fn apply_change(&mut self, entity_id: &str, new_state: Option<EntityState>) {

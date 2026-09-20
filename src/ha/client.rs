@@ -2,6 +2,8 @@
 //!
 //! The UI sends [`HaCommand`]s and receives [`HaEvent`]s; it never touches the socket.
 //! The actor reconnects with exponential backoff and re-bootstraps on every connection.
+//! Changes to the area, device and entity registries are pushed by Home Assistant as events;
+//! the affected list is then refetched (coalescing bursts) and sent as [`HaEvent::Registry`].
 //!
 //! Every command gets exactly one outcome. Commands are never held back and replayed on a
 //! later connection: while disconnected, connecting or authenticating they are rejected, and
@@ -31,6 +33,8 @@ use super::types::{
 const PING_EVERY: Duration = Duration::from_secs(30);
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// Bulk edits send a burst of registry events; refetch once, this long after the first.
+const REGISTRY_DEBOUNCE: Duration = Duration::from_millis(300);
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type WsTx = SplitSink<Ws, Message>;
@@ -80,10 +84,19 @@ pub struct Snapshot {
     pub entities: Vec<EntityRegistryEntry>,
 }
 
+/// A registry list refetched after Home Assistant reported a change to it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RegistryUpdate {
+    Areas(Vec<Area>),
+    Devices(Vec<DeviceRegistryEntry>),
+    Entities(Vec<EntityRegistryEntry>),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum HaEvent {
     Status(ConnStatus),
     Snapshot(Snapshot),
+    Registry(RegistryUpdate),
     StateChanged {
         entity_id: String,
         new_state: Option<EntityState>,
@@ -125,6 +138,33 @@ pub enum HaCommand {
     Resync,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Registry {
+    Areas,
+    Devices,
+    Entities,
+}
+
+impl Registry {
+    const ALL: [Registry; 3] = [Registry::Areas, Registry::Devices, Registry::Entities];
+
+    fn list_type(self) -> &'static str {
+        match self {
+            Registry::Areas => "config/area_registry/list",
+            Registry::Devices => "config/device_registry/list",
+            Registry::Entities => "config/entity_registry/list",
+        }
+    }
+
+    fn updated_event(self) -> &'static str {
+        match self {
+            Registry::Areas => "area_registry_updated",
+            Registry::Devices => "device_registry_updated",
+            Registry::Entities => "entity_registry_updated",
+        }
+    }
+}
+
 /// What an outstanding request id is waiting for.
 enum Pending {
     States,
@@ -132,6 +172,10 @@ enum Pending {
     Devices,
     Entities,
     Subscribe,
+    /// A registry-change subscription. Optional: a refusal only means no live updates.
+    SubscribeRegistry,
+    /// A refetch of one registry after a change event.
+    Refresh(Registry),
     Service(String),
     History(String),
     Logbook(Option<String>),
@@ -365,6 +409,12 @@ async fn serve(
         json!({"type": "subscribe_events", "event_type": "state_changed"}),
         Pending::Subscribe,
     );
+    for registry in Registry::ALL {
+        req.send(
+            json!({"type": "subscribe_events", "event_type": registry.updated_event()}),
+            Pending::SubscribeRegistry,
+        );
+    }
     req.send(json!({"type": "config/area_registry/list"}), Pending::Areas);
     req.send(
         json!({"type": "config/device_registry/list"}),
@@ -377,6 +427,10 @@ async fn serve(
     req.send(json!({"type": "get_states"}), Pending::States);
     // Changes that arrive before `get_states` answers are replayed on top of the snapshot.
     let mut early_changes: Vec<HaEvent> = Vec::new();
+    // Registries reported changed and not yet refetched, and when to refetch them. Nothing is
+    // refetched before the snapshot is in, or a reply could be overwritten by older data.
+    let mut stale: Vec<Registry> = Vec::new();
+    let mut refresh_at: Option<Instant> = None;
 
     let mut ping = interval(PING_EVERY);
     ping.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -419,6 +473,11 @@ async fn serve(
                                 } else {
                                     let _ = events.send(ev);
                                 }
+                            } else if let Some(registry) = parse_registry_event(&v) {
+                                if !stale.contains(&registry) {
+                                    stale.push(registry);
+                                }
+                                refresh_at.get_or_insert_with(|| Instant::now() + REGISTRY_DEBOUNCE);
                             }
                         }
                         Some("pong") => {
@@ -437,6 +496,22 @@ async fn serve(
                                 Pending::Subscribe => {
                                     if !ok {
                                         return SessionEnd::Error(format!("subscribe failed: {}", err()));
+                                    }
+                                }
+                                Pending::SubscribeRegistry => {}
+                                Pending::Refresh(registry) => {
+                                    // A failed refetch keeps the previous data; the next change
+                                    // event or a manual resync brings it up to date.
+                                    if !ok {
+                                        continue;
+                                    }
+                                    let update = match registry {
+                                        Registry::Areas => parse_list(result).map(RegistryUpdate::Areas),
+                                        Registry::Devices => parse_list(result).map(RegistryUpdate::Devices),
+                                        Registry::Entities => parse_list(result).map(RegistryUpdate::Entities),
+                                    };
+                                    if let Ok(update) = update {
+                                        let _ = events.send(HaEvent::Registry(update));
                                     }
                                 }
                                 Pending::States | Pending::Areas | Pending::Devices | Pending::Entities => {
@@ -538,6 +613,12 @@ async fn serve(
                     }
                 }
             }
+            _ = sleep_until(refresh_at.unwrap_or_else(Instant::now)), if refresh_at.is_some() && bootstrap_left == 0 => {
+                refresh_at = None;
+                for registry in stale.drain(..) {
+                    req.send(json!({"type": registry.list_type()}), Pending::Refresh(registry));
+                }
+            }
             _ = ping.tick() => {
                 if ping_outstanding.is_some() {
                     return SessionEnd::Error("ping timed out".into());
@@ -623,6 +704,14 @@ fn parse_state_changed(v: &Value) -> Option<HaEvent> {
     })
 }
 
+/// Which registry a `*_registry_updated` event says changed.
+fn parse_registry_event(v: &Value) -> Option<Registry> {
+    let event_type = v["event"]["event_type"].as_str()?;
+    Registry::ALL
+        .into_iter()
+        .find(|r| r.updated_event() == event_type)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -657,6 +746,25 @@ mod tests {
         assert_eq!(parse_state_changed(&event(Some(json!({"state": 5})))), None);
         assert_eq!(parse_state_changed(&event(Some(json!("garbage")))), None);
         assert_eq!(parse_state_changed(&event(None)), None);
+    }
+
+    #[test]
+    fn registry_events_are_recognised() {
+        let ev = |t: &str| json!({"type": "event", "event": {"event_type": t, "data": {}}});
+        assert_eq!(
+            parse_registry_event(&ev("area_registry_updated")),
+            Some(Registry::Areas)
+        );
+        assert_eq!(
+            parse_registry_event(&ev("device_registry_updated")),
+            Some(Registry::Devices)
+        );
+        assert_eq!(
+            parse_registry_event(&ev("entity_registry_updated")),
+            Some(Registry::Entities)
+        );
+        assert_eq!(parse_registry_event(&ev("state_changed")), None);
+        assert_eq!(parse_registry_event(&json!({"type": "event"})), None);
     }
 
     #[test]

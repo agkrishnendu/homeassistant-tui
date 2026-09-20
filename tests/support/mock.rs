@@ -1,7 +1,7 @@
 //! A small in-process fake of Home Assistant's WebSocket API.
 //!
-//! It speaks the auth handshake, bootstrap commands, `state_changed` subscriptions,
-//! `call_service` (with simple semantics for common domains), history and logbook.
+//! It speaks the auth handshake, bootstrap commands, event subscriptions (`state_changed` and
+//! the registry `*_updated` events), `call_service` (with simple semantics for common domains), history and logbook.
 //! Used by the integration tests and by `cargo run --example mock_ha` for demos.
 #![allow(dead_code)]
 
@@ -21,8 +21,10 @@ pub const VERSION: &str = "2026.9.0-mock";
 #[derive(Default)]
 struct Inner {
     states: BTreeMap<String, Value>,
-    /// Outgoing channels of authenticated connections with a state_changed subscription.
-    subscribers: Vec<(u64, mpsc::UnboundedSender<Message>)>,
+    areas: Vec<Value>,
+    registry: Vec<Value>,
+    /// (subscription id, event type, outgoing channel) of every `subscribe_events`.
+    subscribers: Vec<(u64, String, mpsc::UnboundedSender<Message>)>,
     calls: Vec<(String, String, Value)>,
     /// Wait this long before accepting a token.
     auth_delay: std::time::Duration,
@@ -50,6 +52,8 @@ impl MockHa {
             token: token.into(),
             inner: Arc::new(Mutex::new(Inner {
                 states: fixture_states(),
+                areas: fixture_areas().as_array().cloned().unwrap_or_default(),
+                registry: fixture_registry().as_array().cloned().unwrap_or_default(),
                 ..Default::default()
             })),
             kick,
@@ -117,6 +121,45 @@ impl MockHa {
         broadcast_change(&mut inner, id, Some(old), Some(new));
     }
 
+    /// Move an entity to another area (or none) and fire `entity_registry_updated`.
+    pub fn set_entity_area(&self, id: &str, area_id: Option<&str>) {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(row) = inner.registry.iter_mut().find(|r| r["entity_id"] == id) else {
+            return;
+        };
+        row["area_id"] = area_id.into();
+        broadcast_event(
+            &mut inner,
+            "entity_registry_updated",
+            json!({"action": "update", "entity_id": id, "changes": {"area_id": null}}),
+        );
+    }
+
+    /// Rename an area and fire `area_registry_updated`.
+    pub fn rename_area(&self, area_id: &str, name: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(row) = inner.areas.iter_mut().find(|a| a["area_id"] == area_id) else {
+            return;
+        };
+        row["name"] = name.into();
+        broadcast_event(
+            &mut inner,
+            "area_registry_updated",
+            json!({"action": "update", "area_id": area_id}),
+        );
+    }
+
+    /// Number of registry list requests received so far, by command type.
+    pub fn count_received(&self, command_type: &str) -> usize {
+        self.inner
+            .lock()
+            .unwrap()
+            .received
+            .iter()
+            .filter(|t| *t == command_type)
+            .count()
+    }
+
     async fn connection(&self, ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>) {
         let (mut sink, mut stream) = ws.split();
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Message>();
@@ -176,11 +219,12 @@ impl MockHa {
             match kind {
                 "ping" => send(json!({"id": id, "type": "pong"})),
                 "subscribe_events" => {
+                    let event_type = v["event_type"].as_str().unwrap_or("").to_string();
                     self.inner
                         .lock()
                         .unwrap()
                         .subscribers
-                        .push((id, out_tx.clone()));
+                        .push((id, event_type, out_tx.clone()));
                     send(ok(Value::Null));
                 }
                 "get_states" => {
@@ -194,9 +238,15 @@ impl MockHa {
                         .collect();
                     send(ok(Value::Array(states)));
                 }
-                "config/area_registry/list" => send(ok(fixture_areas())),
+                "config/area_registry/list" => {
+                    let areas = self.inner.lock().unwrap().areas.clone();
+                    send(ok(Value::Array(areas)));
+                }
                 "config/device_registry/list" => send(ok(fixture_devices())),
-                "config/entity_registry/list" => send(ok(fixture_registry())),
+                "config/entity_registry/list" => {
+                    let registry = self.inner.lock().unwrap().registry.clone();
+                    send(ok(Value::Array(registry)));
+                }
                 "call_service" => {
                     let domain = v["domain"].as_str().unwrap_or("").to_string();
                     let service = v["service"].as_str().unwrap_or("").to_string();
@@ -245,7 +295,7 @@ impl MockHa {
             .lock()
             .unwrap()
             .subscribers
-            .retain(|(_, tx)| !tx.same_channel(&out_tx));
+            .retain(|(_, _, tx)| !tx.same_channel(&out_tx));
         drop(out_tx);
         let _ = writer.await;
     }
@@ -258,13 +308,25 @@ fn touch(state: &mut Value) {
 }
 
 fn broadcast_change(inner: &mut Inner, id: &str, old: Option<Value>, new: Option<Value>) {
-    inner.subscribers.retain(|(sub_id, tx)| {
+    broadcast_event(
+        inner,
+        "state_changed",
+        json!({"entity_id": id, "old_state": old, "new_state": new}),
+    );
+}
+
+/// Send an event to every subscription for `event_type`.
+fn broadcast_event(inner: &mut Inner, event_type: &str, data: Value) {
+    inner.subscribers.retain(|(sub_id, ty, tx)| {
+        if ty != event_type {
+            return true;
+        }
         let ev = json!({
             "id": sub_id,
             "type": "event",
             "event": {
-                "event_type": "state_changed",
-                "data": {"entity_id": id, "old_state": old, "new_state": new},
+                "event_type": event_type,
+                "data": data,
                 "origin": "LOCAL",
                 "time_fired": Utc::now().to_rfc3339(),
             }

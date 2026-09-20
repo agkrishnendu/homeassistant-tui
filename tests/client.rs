@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use chrono::Utc;
 use homeassistant_tui::config::ws_url;
-use homeassistant_tui::ha::client::{self, ConnStatus, HaCommand, HaEvent, Timeouts};
+use homeassistant_tui::ha::client::{
+    self, ConnStatus, HaCommand, HaEvent, RegistryUpdate, Timeouts,
+};
 use homeassistant_tui::ha::types::ServiceCall;
 use support::mock::MockHa;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -97,6 +99,69 @@ async fn bootstrap_delivers_snapshot() {
         snap.entities
             .iter()
             .any(|e| e.entity_id == "lock.front_door" && e.device_id.is_some())
+    );
+}
+
+#[tokio::test]
+async fn registry_changes_are_refetched_and_coalesced() {
+    let ha = MockHa::start(TOKEN, "127.0.0.1:0").await;
+    let (_tx, mut rx) = ready(&ha).await;
+    assert_eq!(ha.count_received("config/entity_registry/list"), 1);
+
+    // A burst of edits to one registry becomes a single refetch.
+    for area in ["bedroom", "garage", "entrance", "kitchen", "bedroom"] {
+        ha.set_entity_area("light.kitchen", Some(area));
+    }
+    ha.rename_area("bedroom", "Master Bedroom");
+
+    let mut entities = None;
+    let mut areas = None;
+    while entities.is_none() || areas.is_none() {
+        match wait_for(&mut rx, |e| match e {
+            HaEvent::Registry(u) => Some(u),
+            _ => None,
+        })
+        .await
+        {
+            RegistryUpdate::Entities(l) => entities = Some(l),
+            RegistryUpdate::Areas(l) => areas = Some(l),
+            RegistryUpdate::Devices(_) => panic!("devices did not change"),
+        }
+    }
+    let kitchen = entities
+        .unwrap()
+        .into_iter()
+        .find(|e| e.entity_id == "light.kitchen")
+        .unwrap();
+    assert_eq!(kitchen.area_id.as_deref(), Some("bedroom"));
+    assert!(
+        areas
+            .unwrap()
+            .iter()
+            .any(|a| a.area_id == "bedroom" && a.name == "Master Bedroom")
+    );
+
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(ha.count_received("config/entity_registry/list"), 2);
+    assert_eq!(ha.count_received("config/area_registry/list"), 2);
+    assert_eq!(ha.count_received("config/device_registry/list"), 1);
+}
+
+#[tokio::test]
+async fn registry_refetch_waits_for_the_snapshot() {
+    let ha = MockHa::start(TOKEN, "127.0.0.1:0").await;
+    // Hold the bootstrap open (get_states never answers) and change a registry meanwhile.
+    ha.silence("get_states");
+    let (_tx, _rx) = connect(&ha, TOKEN).await;
+    while ha.count_received("get_states") == 0 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    ha.set_entity_area("light.kitchen", None);
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(
+        ha.count_received("config/entity_registry/list"),
+        1,
+        "no refetch before the snapshot is in"
     );
 }
 
