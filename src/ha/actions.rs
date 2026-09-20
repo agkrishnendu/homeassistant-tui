@@ -167,9 +167,12 @@ pub fn service_for(e: &EntityState, action: Action) -> Option<ServiceCall> {
             feature::media_player::PAUSE | feature::media_player::PLAY,
         )
         .then(|| call("media_play_pause")),
-        ("media_player", Increase | Decrease) => supports(
+        ("media_player", Increase | Decrease) => supports_any(
             e,
-            feature::media_player::VOLUME_STEP | feature::media_player::VOLUME_SET,
+            &[
+                feature::media_player::VOLUME_STEP,
+                feature::media_player::VOLUME_SET,
+            ],
         )
         .then(|| {
             call(if action == Increase {
@@ -250,18 +253,25 @@ fn is_read_only(domain: &str) -> bool {
     )
 }
 
-/// Whether the entity advertises any of the `flags` in `supported_features`.
-/// An entity that doesn't report the attribute at all is assumed capable, so an unknown
-/// device still gets its controls and Home Assistant remains the judge.
+/// Whether the entity advertises every bit of `flags` in `supported_features`, which is how
+/// Home Assistant checks a service registered with one combined requirement (`toggle` on a
+/// cover needs `OPEN | CLOSE`). An entity that doesn't report the attribute at all is assumed
+/// capable, so an unknown device still gets its controls and Home Assistant remains the judge.
 fn supports(e: &EntityState, flags: u64) -> bool {
     match e
         .attributes
         .get("supported_features")
         .and_then(Value::as_u64)
     {
-        Some(bits) => bits & flags != 0,
+        Some(bits) => bits & flags == flags,
         None => true,
     }
+}
+
+/// Whether the entity satisfies any one of several alternative requirements, for services
+/// Home Assistant registers with a list (volume up needs `VOLUME_SET` or `VOLUME_STEP`).
+fn supports_any(e: &EntityState, alternatives: &[u64]) -> bool {
+    alternatives.iter().any(|flags| supports(e, *flags))
 }
 
 /// `supported_color_modes` when the light reports it.
@@ -431,6 +441,12 @@ mod tests {
 
     #[test]
     fn cover_controls_follow_supported_features() {
+        // Toggle needs both directions, so a cover that can only open has no Enter action.
+        let open_only = ent("cover.o", "closed", json!({"supported_features": 1}));
+        assert!(service_for(&open_only, Action::Open).is_some());
+        assert!(service_for(&open_only, Action::Close).is_none());
+        assert!(service_for(&open_only, Action::Primary).is_none());
+
         // OPEN | CLOSE only: no stop, no position.
         let basic = ent(
             "cover.b",
@@ -462,11 +478,11 @@ mod tests {
 
     #[test]
     fn media_player_controls_follow_supported_features() {
-        // PAUSE | PREVIOUS_TRACK | NEXT_TRACK | VOLUME_STEP | SELECT_SOURCE
+        // PAUSE | PLAY | PREVIOUS_TRACK | NEXT_TRACK | VOLUME_STEP | SELECT_SOURCE
         let tv = ent(
             "media_player.tv",
             "playing",
-            json!({"supported_features": 1 | 16 | 32 | 1024 | 2048, "source_list": ["a", "b"]}),
+            json!({"supported_features": 1 | 16384 | 16 | 32 | 1024 | 2048, "source_list": ["a", "b"]}),
         );
         assert_eq!(
             service_for(&tv, Action::Primary).unwrap().name(),
@@ -478,11 +494,30 @@ mod tests {
         assert!(service_for(&tv, Action::CycleMode).is_some());
         assert!(service_for(&tv, Action::Stop).is_none());
 
+        // play_pause needs PLAY and PAUSE together; either alone isn't enough.
+        for only in [1, 16384] {
+            let p = ent(
+                "media_player.p",
+                "playing",
+                json!({"supported_features": only}),
+            );
+            assert!(service_for(&p, Action::Primary).is_none(), "{only}");
+        }
+        // Volume accepts VOLUME_SET or VOLUME_STEP.
+        for vol in [4, 1024] {
+            let p = ent(
+                "media_player.v",
+                "playing",
+                json!({"supported_features": vol}),
+            );
+            assert!(service_for(&p, Action::Increase).is_some(), "{vol}");
+        }
+
         // A speaker that only plays/pauses.
         let basic = ent(
             "media_player.s",
             "playing",
-            json!({"supported_features": 1}),
+            json!({"supported_features": 1 | 16384}),
         );
         assert!(service_for(&basic, Action::Primary).is_some());
         assert!(service_for(&basic, Action::Next).is_none());
@@ -541,6 +576,7 @@ mod tests {
         );
 
         let valve = ent("valve.v", "open", json!({"supported_features": 2}));
+        assert!(service_for(&valve, Action::Primary).is_none());
         assert!(service_for(&valve, Action::Open).is_none());
         assert!(service_for(&valve, Action::Close).is_some());
         assert!(service_for(&valve, Action::Stop).is_none());
